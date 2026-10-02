@@ -1,18 +1,18 @@
 /** Workflow V1 Trace 面板 */
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { Card, Tabs, Spin, Empty, Typography, Tag, Descriptions, Alert } from 'antd';
+import { Card, Tabs, Spin, Empty, Tag, Descriptions, Alert } from 'antd';
 import {
   getRunTrace, getRun, type WorkflowTrace, type WorkflowRunDetail,
 } from '../../api/workflowApi';
 import { RUN_STATUS_COLORS, RUN_STATUS_LABELS } from '../../types/workflow';
-import type { WorkflowRunStatus, NodeType, NodeStatus, ApprovalDecision } from '../../types/workflow';
+import type { WorkflowRunStatus, NodeType, NodeStatus } from '../../types/workflow';
 import { WorkflowRunTimeline } from './WorkflowRunTimeline';
 import { WorkflowNodeCard } from './WorkflowNodeCard';
 import { WorkflowObservabilityView } from './WorkflowObservabilityView';
 import { WorkflowApprovalCard } from './WorkflowApprovalCard';
 import { WorkflowActionRecordCard } from './WorkflowActionRecordCard';
 import { WorkflowErrorBoundary } from './WorkflowErrorBoundary';
-import { processApproval, resumeRun } from '../../api/workflowApi';
+import { cancelRun, processApproval, resumeRun, retryNode } from '../../api/workflowApi';
 import { workflowTemplateVersionLabel } from '../../utils/display';
 import { getPlan } from '../../api/planningApi';
 import type { PlanDetail } from '../../types/planning';
@@ -36,6 +36,8 @@ export const WorkflowTracePanel: React.FC<Props> = ({ runId, visible = true, onR
   const [trace, setTrace] = useState<WorkflowTrace | null>(null);
   const [detail, setDetail] = useState<WorkflowRunDetail | null>(null);
   const [plan, setPlan] = useState<PlanDetail | null>(null);
+  const [operationError, setOperationError] = useState<string | null>(null);
+  const [operationPending, setOperationPending] = useState(false);
   const requestRef = useRef(0), alive = useRef(true), selectionRef = useRef(runId);
   selectionRef.current = runId;
 
@@ -92,8 +94,12 @@ export const WorkflowTracePanel: React.FC<Props> = ({ runId, visible = true, onR
 
   const handleApprove = async (approvalId: string, comment: string) => {
     await confirmCurrentApproval(approvalId);
-    await processApproval(runId, approvalId, { action: 'approve', comment });
-    await resumeApprovedRun();
+    const result = await processApproval(runId, approvalId, { action: 'approve', comment });
+    if (result.continuationScheduled) {
+      await load(); onRefresh?.();
+    } else {
+      await resumeApprovedRun();
+    }
   };
 
   const handleReject = async (approvalId: string, comment: string) => {
@@ -104,15 +110,42 @@ export const WorkflowTracePanel: React.FC<Props> = ({ runId, visible = true, onR
 
   const handleEditAndApprove = async (approvalId: string, editedActions: Array<Record<string, unknown>>, comment: string) => {
     await confirmCurrentApproval(approvalId);
-    await processApproval(runId, approvalId, { action: 'edit_and_approve', editedActions, comment });
-    await resumeApprovedRun();
+    const result = await processApproval(runId, approvalId, { action: 'edit_and_approve', editedActions, comment });
+    if (result.continuationScheduled) {
+      await load(); onRefresh?.();
+    } else {
+      await resumeApprovedRun();
+    }
+  };
+
+  const runOperation = async (operation: () => Promise<unknown>) => {
+    setOperationPending(true); setOperationError(null);
+    try {
+      await operation();
+      if (alive.current && selectionRef.current === runId) {
+        await load();
+        onRefresh?.();
+      }
+    } catch (e: unknown) {
+      if (alive.current && selectionRef.current === runId) {
+        setOperationError(e instanceof Error ? e.message : '操作失败');
+      }
+    } finally {
+      if (alive.current && selectionRef.current === runId) setOperationPending(false);
+    }
   };
 
   if (loading || (detail && detail.run.runId !== runId)) return <div style={{textAlign:'center',padding:40}}><Spin /><div style={{fontSize:12,color:'#9CA3AF',marginTop:8}}>正在加载处置执行...</div></div>;
   if (error) return <Alert type="error" message={error} />;
   if (!trace || !detail) return <Empty description="尚未加载执行记录" />;
 
-  const status = (trace?.status || 'pending') as WorkflowRunStatus;
+  // Detail is the authoritative snapshot for runtime state and operation
+  // permissions.  Trace is fetched separately and can lag by one transition.
+  const status = (detail.run.status || 'pending') as WorkflowRunStatus;
+  const operations = detail.operations || {
+    canRetry: false, canResume: false, canCancel: false, retryNodeId: null,
+  };
+  const runtime = detail.runtime;
 
   const timelineEntries = (trace?.timeline || []).map((e: Record<string, unknown>) => ({
     eventType: e.eventType as string || '',
@@ -160,6 +193,44 @@ export const WorkflowTracePanel: React.FC<Props> = ({ runId, visible = true, onR
     <WorkflowErrorBoundary runId={runId}>
       <div data-workflow-detail={runId}>
       <ExecutionSummary detail={detail} plan={plan} onOpenPlan={onOpenPlan} onOpenJudgment={onOpenJudgment} />
+      {runtime?.failure && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={`步骤 ${runtime.failure.nodeId || '未知'} 执行失败`}
+          description={`${runtime.failure.message}${runtime.failure.attempt ? `（第 ${runtime.failure.attempt} 次尝试）` : ''}`}
+        />
+      )}
+      {status === 'cancelled' && runtime?.cancelReason && (
+        <Alert type="info" style={{ marginBottom: 12 }} message="流程已取消" description={runtime.cancelReason} />
+      )}
+      {operationError && <Alert type="error" showIcon style={{ marginBottom: 12 }} message="操作未完成" description={operationError} />}
+      {(operations.canRetry || operations.canResume || operations.canCancel) && (
+        <div data-workflow-operations style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+          {operations.canRetry && operations.retryNodeId && (
+            <button disabled={operationPending} onClick={() => runOperation(() => retryNode(runId, operations.retryNodeId!))}
+              style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #F59E0B', background: '#FFFBEB', color: '#92400E', cursor: operationPending ? 'not-allowed' : 'pointer' }}>
+              重试失败步骤
+            </button>
+          )}
+          {operations.canResume && (
+            <button disabled={operationPending} onClick={() => runOperation(() => resumeApprovedRun())}
+              style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #0F766E', background: '#F0FDFA', color: '#0F766E', cursor: operationPending ? 'not-allowed' : 'pointer' }}>
+              继续执行
+            </button>
+          )}
+          {operations.canCancel && (
+            <button disabled={operationPending} onClick={() => {
+              const reason = window.prompt('请填写取消原因（可留空）', '') ?? null;
+              if (reason !== null) void runOperation(() => cancelRun(runId, reason));
+            }}
+              style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #FCA5A5', background: '#FFF', color: '#DC2626', cursor: operationPending ? 'not-allowed' : 'pointer' }}>
+              取消流程
+            </button>
+          )}
+        </div>
+      )}
       {approvalError && <Alert type="error" message={approvalError} />}
       {pendingApproval ? <WorkflowApprovalCard
         key={text(pendingApproval.approvalId)} approvalId={text(pendingApproval.approvalId)} runId={runId} nodeId={text(pendingApproval.nodeId)}

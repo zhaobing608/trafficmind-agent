@@ -37,6 +37,16 @@ _MIGRATION_COLUMNS = [
     ("isMainRoad", "INTEGER DEFAULT 0"),
     ("nearbySchool", "INTEGER DEFAULT 0"),
     ("nearbyHospital", "INTEGER DEFAULT 0"),
+    # Phase 21: canonical ingestion identity and audit metadata.  These are
+    # additive columns so databases created by earlier phases remain valid.
+    ("source", "TEXT DEFAULT 'legacy'"),
+    ("sourceEventId", "TEXT DEFAULT ''"),
+    ("occurredAt", "TEXT DEFAULT ''"),
+    ("receivedAt", "TEXT DEFAULT ''"),
+    ("lastReceivedAt", "TEXT DEFAULT ''"),
+    ("sourceMetadata", "TEXT DEFAULT '{}'"),
+    ("payloadFingerprint", "TEXT DEFAULT ''"),
+    ("revision", "INTEGER DEFAULT 1"),
 ]
 
 
@@ -72,6 +82,13 @@ def init_db() -> None:
         )
     """)
     _migrate_schema(cursor)
+    # Empty sourceEventId values are legacy rows and deliberately excluded.
+    # Real ingested events are uniquely identified by their upstream source.
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_event_records_source_identity
+        ON event_records(source, sourceEventId)
+        WHERE sourceEventId IS NOT NULL AND sourceEventId <> ''
+    """)
     conn.commit()
     conn.close()
 
@@ -96,13 +113,42 @@ def save_event_analysis(result: Dict[str, Any]) -> bool:
         event_id = result.get("eventId", standard_event.get("eventId", ""))
 
         cursor.execute("""
-            INSERT OR REPLACE INTO event_records
+            INSERT INTO event_records
                 (eventId, eventType, eventTypeCn, roadName, direction,
                  avgSpeed, queueLength, duration,
                  weather, timePeriod, isMainRoad, nearbySchool, nearbyHospital,
                  riskScore, riskLevel, status, report,
                  rawEvent, fullResult, createdAt, updatedAt)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(eventId) DO UPDATE SET
+                eventType=excluded.eventType,
+                eventTypeCn=excluded.eventTypeCn,
+                roadName=excluded.roadName,
+                direction=excluded.direction,
+                avgSpeed=excluded.avgSpeed,
+                queueLength=excluded.queueLength,
+                duration=excluded.duration,
+                weather=excluded.weather,
+                timePeriod=excluded.timePeriod,
+                isMainRoad=excluded.isMainRoad,
+                nearbySchool=excluded.nearbySchool,
+                nearbyHospital=excluded.nearbyHospital,
+                riskScore=excluded.riskScore,
+                riskLevel=excluded.riskLevel,
+                status=CASE
+                    -- A canonical ingestion row owns a durable lifecycle.  A
+                    -- delayed analysis result may refresh its payload/risk,
+                    -- but must not move an already-advanced event backwards.
+                    -- The runtime advances these rows explicitly through
+                    -- compare-and-set transitions in ``advance_event_status``.
+                    WHEN COALESCE(event_records.sourceEventId, '') <> ''
+                        THEN event_records.status
+                    ELSE excluded.status
+                END,
+                report=excluded.report,
+                rawEvent=excluded.rawEvent,
+                fullResult=excluded.fullResult,
+                updatedAt=excluded.updatedAt
         """, (
             event_id,
             standard_event.get("eventType", ""),
@@ -149,7 +195,8 @@ def get_history(limit: int = 50) -> List[Dict[str, Any]]:
     cursor = conn.cursor()
     cursor.execute(
         "SELECT eventId, eventType, eventTypeCn, roadName, riskScore, "
-        "riskLevel, status, createdAt, updatedAt, rawEvent "
+        "riskLevel, status, createdAt, updatedAt, rawEvent, "
+        "source, sourceEventId, occurredAt, receivedAt, lastReceivedAt, revision "
         "FROM event_records ORDER BY updatedAt DESC LIMIT ?",
         (limit,),
     )
@@ -197,7 +244,7 @@ def get_event_by_id(event_id: str) -> Optional[Dict[str, Any]]:
 
     record = dict(row)
     # 将 JSON 字符串还原为对象
-    for field in ("rawEvent", "fullResult"):
+    for field in ("rawEvent", "fullResult", "sourceMetadata"):
         if field in record and isinstance(record[field], str):
             try:
                 record[field] = json.loads(record[field])
@@ -235,6 +282,44 @@ def update_event_status(event_id: str, status: str) -> bool:
     conn.commit()
     conn.close()
     return affected > 0
+
+
+def advance_event_status(
+    event_id: str,
+    status: str,
+    *,
+    allowed_from: Optional[List[str]] = None,
+) -> bool:
+    """Advance a canonical event lifecycle without overwriting newer truth.
+
+    ``allowed_from`` makes runtime callbacks compare-and-set operations.  A
+    delayed Agent/Workflow callback therefore cannot regress an event that has
+    already moved further through the existing Chinese business lifecycle.
+    """
+    from backend.config import EVENT_STATUSES
+
+    if status not in EVENT_STATUSES:
+        return False
+    init_db()
+    conn = get_connection()
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if allowed_from:
+            placeholders = ",".join("?" for _ in allowed_from)
+            cursor = conn.execute(
+                f"UPDATE event_records SET status=?, updatedAt=? "
+                f"WHERE eventId=? AND status IN ({placeholders})",
+                (status, now, event_id, *allowed_from),
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE event_records SET status=?, updatedAt=? WHERE eventId=?",
+                (status, now, event_id),
+            )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
 
 
 def get_stats() -> Dict[str, Any]:

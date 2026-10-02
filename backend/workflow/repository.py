@@ -38,6 +38,7 @@ from backend.workflow.models import (
     WorkflowNodeRun,
     WorkflowRun,
     WorkflowRunStatus,
+    generate_event_id,
 )
 from backend.workflow.definition import WorkflowRepository as AbstractWorkflowRepository
 
@@ -431,7 +432,9 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                    status=excluded.status, current_node_id=excluded.current_node_id,
                    state_json=excluded.state_json, started_at=excluded.started_at,
                    updated_at=excluded.updated_at, completed_at=excluded.completed_at,
-                   triggered_by=excluded.triggered_by""",
+                   triggered_by=excluded.triggered_by
+               WHERE workflow_runs.status != 'cancelled'
+                  OR excluded.status = 'cancelled'""",
             (
                 run.run_id,
                 run.definition_id,
@@ -576,6 +579,134 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
         conn.commit()
         conn.close()
 
+    def finalize_node_run(
+        self,
+        node_run: WorkflowNodeRun,
+        *,
+        driver_owner: str = "",
+        driver_generation: int = 0,
+        checkpoint_run: Optional[WorkflowRun] = None,
+    ) -> bool:
+        """Persist a terminal node attempt only while its run may still advance.
+
+        A RUNNING attempt is written before execution.  This conditional update
+        closes that same attempt only if cancellation has not won the race.  For
+        driver-managed runs the current owner/generation and lease are checked in
+        the same SQLite statement, so a stale worker cannot write a late terminal
+        result or advance control state.
+        """
+        init_workflow_tables()
+        _ensure_driver_columns()
+        conn = _get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            run_predicate = "r.run_id=? AND r.status != 'cancelled'"
+            predicate_params: List[Any] = [node_run.run_id]
+            if driver_owner:
+                run_predicate += (
+                    " AND r.driver_owner=? AND r.driver_generation=?"
+                    " AND r.driver_lease_until IS NOT NULL"
+                    " AND r.driver_lease_until >= ?"
+                )
+                predicate_params.extend([
+                    driver_owner,
+                    int(driver_generation),
+                    _utc_now_iso(),
+                ])
+            cursor = conn.execute(
+                f"""UPDATE workflow_node_runs SET
+                        status=?, attempt=?, max_attempts=?,
+                        input_snapshot_json=?, output_snapshot_json=?, error=?,
+                        started_at=?, completed_at=?, duration_ms=?
+                    WHERE node_run_id=? AND status='running' AND EXISTS (
+                        SELECT 1 FROM workflow_runs AS r WHERE {run_predicate}
+                    )""",
+                (
+                    node_run.status.value,
+                    node_run.attempt,
+                    node_run.max_attempts,
+                    json.dumps(node_run.input_snapshot, ensure_ascii=False),
+                    json.dumps(node_run.output_snapshot, ensure_ascii=False),
+                    node_run.error,
+                    node_run.started_at,
+                    node_run.completed_at,
+                    node_run.duration_ms,
+                    node_run.node_run_id,
+                    *predicate_params,
+                ),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return False
+
+            if checkpoint_run is not None:
+                checkpoint_predicate = "run_id=? AND status != 'cancelled'"
+                checkpoint_params: List[Any] = [checkpoint_run.run_id]
+                if driver_owner:
+                    checkpoint_predicate += (
+                        " AND driver_owner=? AND driver_generation=?"
+                        " AND driver_lease_until IS NOT NULL"
+                        " AND driver_lease_until >= ?"
+                    )
+                    checkpoint_params.extend([
+                        driver_owner,
+                        int(driver_generation),
+                        _utc_now_iso(),
+                    ])
+                checkpoint = conn.execute(
+                    f"""UPDATE workflow_runs SET
+                            status=?, current_node_id=?, state_json=?,
+                            started_at=?, updated_at=?, completed_at=?
+                        WHERE {checkpoint_predicate}""",
+                    (
+                        checkpoint_run.status.value,
+                        checkpoint_run.current_node_id,
+                        json.dumps(checkpoint_run.state, ensure_ascii=False),
+                        checkpoint_run.started_at,
+                        checkpoint_run.updated_at,
+                        checkpoint_run.completed_at,
+                        *checkpoint_params,
+                    ),
+                )
+                if checkpoint.rowcount != 1:
+                    conn.rollback()
+                    return False
+                if checkpoint_run.status == WorkflowRunStatus.COMPLETED:
+                    checkpoint_state = (
+                        checkpoint_run.state
+                        if isinstance(checkpoint_run.state, dict)
+                        else {}
+                    )
+                    current_event = checkpoint_state.get("currentEvent") or {}
+                    if (
+                        isinstance(current_event, dict)
+                        and current_event.get("actionExecutionAllowed", True) is not False
+                    ):
+                        event_id = str(
+                            current_event.get("eventId")
+                            or current_event.get("event_id")
+                            or ""
+                        ).strip()
+                        table_exists = conn.execute(
+                            """SELECT 1 FROM sqlite_master
+                               WHERE type='table' AND name='event_records'"""
+                        ).fetchone()
+                        if event_id and table_exists:
+                            conn.execute(
+                                """UPDATE event_records
+                                   SET status='已处置', updatedAt=?
+                                   WHERE eventId=?
+                                     AND status IN ('待研判','待派单','处置中')""",
+                                (_utc_now_iso(), event_id),
+                            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def get_node_runs(self, run_id: str) -> List[WorkflowNodeRun]:
         init_workflow_tables()
         conn = _get_conn()
@@ -612,28 +743,113 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
     # ── Event CRUD ───────────────────────────────────────────────────────
 
     def save_event(self, event: WorkflowEvent) -> None:
+        """Insert an immutable audit event.
+
+        Historical callers may provide their own event id/sequence.  A replay
+        of the exact same event id is idempotent, but an existing audit record
+        is never replaced or mutated.
+        """
         init_workflow_tables()
         conn = _get_conn()
-        conn.execute(
-            """INSERT OR REPLACE INTO workflow_events VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                event.event_id,
-                event.run_id,
-                event.node_id,
-                event.event_type,
-                json.dumps(event.payload, ensure_ascii=False),
-                event.sequence,
-                event.created_at,
-            ),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """INSERT INTO workflow_events VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(event_id) DO NOTHING""",
+                (
+                    event.event_id,
+                    event.run_id,
+                    event.node_id,
+                    event.event_type,
+                    json.dumps(event.payload, ensure_ascii=False),
+                    event.sequence,
+                    event.created_at,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def append_event(
+        self,
+        run_id: str,
+        event_type: str,
+        *,
+        node_id: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+        event_id: str = "",
+        created_at: str = "",
+    ) -> WorkflowEvent:
+        """Atomically allocate and append one per-run audit sequence.
+
+        ``BEGIN IMMEDIATE`` serialises the MAX+1 allocation with the INSERT,
+        preventing two workers from receiving the same sequence.  Runtime
+        callers use this method instead of the legacy split
+        ``next_event_sequence``/``save_event`` pair.
+        """
+        init_workflow_tables()
+        conn = _get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if event_id:
+                existing = conn.execute(
+                    "SELECT * FROM workflow_events WHERE event_id=?",
+                    (event_id,),
+                ).fetchone()
+                if existing is not None:
+                    conn.rollback()
+                    raw_payload = existing["payload_json"] or "{}"
+                    return WorkflowEvent(
+                        event_id=existing["event_id"],
+                        run_id=existing["run_id"],
+                        node_id=existing["node_id"] or "",
+                        event_type=existing["event_type"] or "",
+                        payload=json.loads(raw_payload),
+                        sequence=int(existing["sequence"] or 0),
+                        created_at=existing["created_at"] or "",
+                    )
+            row = conn.execute(
+                "SELECT MAX(sequence) AS seq FROM workflow_events WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            sequence = (
+                int(row["seq"]) + 1
+                if row is not None and row["seq"] is not None
+                else 0
+            )
+            event = WorkflowEvent(
+                event_id=event_id or generate_event_id(run_id, sequence),
+                run_id=run_id,
+                node_id=node_id,
+                event_type=event_type,
+                payload=dict(payload or {}),
+                sequence=sequence,
+                created_at=created_at,
+            )
+            conn.execute(
+                "INSERT INTO workflow_events VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.event_id,
+                    event.run_id,
+                    event.node_id,
+                    event.event_type,
+                    json.dumps(event.payload, ensure_ascii=False),
+                    event.sequence,
+                    event.created_at,
+                ),
+            )
+            conn.commit()
+            return event
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def list_events(self, run_id: str) -> List[WorkflowEvent]:
         init_workflow_tables()
         conn = _get_conn()
         rows = conn.execute(
-            "SELECT * FROM workflow_events WHERE run_id=? ORDER BY sequence",
+            "SELECT * FROM workflow_events WHERE run_id=? ORDER BY sequence, rowid",
             (run_id,),
         ).fetchall()
         conn.close()
@@ -654,15 +870,35 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             ))
         return results
 
+    def next_event_sequence(self, run_id: str) -> int:
+        """Preview the next sequence (not an allocator; use append_event)."""
+        init_workflow_tables()
+        conn = _get_conn()
+        try:
+            row = conn.execute(
+                "SELECT MAX(sequence) AS seq FROM workflow_events WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            return int(row["seq"] or 0) + 1 if row and row["seq"] is not None else 0
+        finally:
+            conn.close()
+
     # ── Approval CRUD ────────────────────────────────────────────────────
 
     def save_approval(self, approval: WorkflowApproval) -> None:
         init_workflow_tables()
         conn = _get_conn()
         conn.execute(
-            """INSERT OR REPLACE INTO workflow_approvals VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )""",
+            """INSERT INTO workflow_approvals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(approval_id) DO UPDATE SET
+                   run_id=excluded.run_id,
+                   node_id=excluded.node_id,
+                   proposed_actions_json=excluded.proposed_actions_json,
+                   edited_actions_json=excluded.edited_actions_json,
+                   decision=excluded.decision,
+                   reviewer=excluded.reviewer,
+                   comment=excluded.comment,
+                   decided_at=excluded.decided_at""",
             (
                 approval.approval_id,
                 approval.run_id,
@@ -678,6 +914,177 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
         )
         conn.commit()
         conn.close()
+
+    def decide_approval(self, approval: WorkflowApproval) -> bool:
+        """Atomically apply one decision to a still-pending approval."""
+        init_workflow_tables()
+        conn = _get_conn()
+        try:
+            cursor = conn.execute(
+                """UPDATE workflow_approvals SET
+                       edited_actions_json=?, decision=?, reviewer=?, comment=?, decided_at=?
+                   WHERE approval_id=? AND run_id=? AND decision='pending'""",
+                (
+                    json.dumps(approval.edited_actions, ensure_ascii=False),
+                    approval.decision.value,
+                    approval.reviewer,
+                    approval.comment,
+                    approval.decided_at,
+                    approval.approval_id,
+                    approval.run_id,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+        finally:
+            conn.close()
+
+    def decide_approval_and_transition(
+        self,
+        approval: WorkflowApproval,
+        run: WorkflowRun,
+        *,
+        expected_status: str = "awaiting_approval",
+        ensure_driver_managed: bool = False,
+        audit_events: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """Commit approval, run checkpoint, and audit events in one transaction.
+
+        Returns a stable result code: ``updated``, ``not_found``,
+        ``invalid_status``, ``approval_mismatch``, or
+        ``approval_not_pending``.  Serialising the validation and writes under
+        ``BEGIN IMMEDIATE`` closes both cancellation and process-crash windows.
+        """
+        init_workflow_tables()
+        _ensure_driver_columns()
+        conn = _get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, state_json FROM workflow_runs WHERE run_id=?",
+                (run.run_id,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return "not_found"
+            if row["status"] != expected_status:
+                conn.rollback()
+                return "invalid_status"
+            persisted_state = json.loads(row["state_json"] or "{}")
+            pending = (
+                persisted_state.get("pendingApproval")
+                or persisted_state.get("pending_approval")
+                or {}
+            )
+            if not isinstance(pending, dict) or pending.get("approvalId") != approval.approval_id:
+                conn.rollback()
+                return "approval_mismatch"
+
+            existing = conn.execute(
+                "SELECT run_id, decision FROM workflow_approvals WHERE approval_id=?",
+                (approval.approval_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """INSERT INTO workflow_approvals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        approval.approval_id,
+                        approval.run_id,
+                        approval.node_id,
+                        json.dumps(approval.proposed_actions, ensure_ascii=False),
+                        "[]",
+                        ApprovalDecision.PENDING.value,
+                        "",
+                        "",
+                        approval.created_at,
+                        "",
+                    ),
+                )
+            elif (
+                existing["run_id"] != approval.run_id
+                or existing["decision"] != ApprovalDecision.PENDING.value
+            ):
+                conn.rollback()
+                return "approval_not_pending"
+
+            approval_update = conn.execute(
+                """UPDATE workflow_approvals SET
+                       edited_actions_json=?, decision=?, reviewer=?, comment=?, decided_at=?
+                   WHERE approval_id=? AND run_id=? AND decision='pending'""",
+                (
+                    json.dumps(approval.edited_actions, ensure_ascii=False),
+                    approval.decision.value,
+                    approval.reviewer,
+                    approval.comment,
+                    approval.decided_at,
+                    approval.approval_id,
+                    approval.run_id,
+                ),
+            )
+            if approval_update.rowcount != 1:
+                conn.rollback()
+                return "approval_not_pending"
+
+            run_update = conn.execute(
+                """UPDATE workflow_runs SET
+                       status=?, current_node_id=?, state_json=?, started_at=?,
+                       updated_at=?, completed_at=?, driver_owner=NULL,
+                       driver_lease_until=NULL,
+                       driver_managed=CASE WHEN ?=1 THEN 1 ELSE driver_managed END
+                   WHERE run_id=? AND status=?""",
+                (
+                    run.status.value,
+                    run.current_node_id,
+                    json.dumps(run.state, ensure_ascii=False),
+                    run.started_at,
+                    run.updated_at,
+                    run.completed_at,
+                    1 if ensure_driver_managed else 0,
+                    run.run_id,
+                    expected_status,
+                ),
+            )
+            if run_update.rowcount != 1:
+                conn.rollback()
+                return "invalid_status"
+
+            for event_data in audit_events or []:
+                seq_row = conn.execute(
+                    "SELECT MAX(sequence) AS seq FROM workflow_events WHERE run_id=?",
+                    (run.run_id,),
+                ).fetchone()
+                sequence = (
+                    int(seq_row["seq"]) + 1
+                    if seq_row is not None and seq_row["seq"] is not None
+                    else 0
+                )
+                event = WorkflowEvent(
+                    event_id=generate_event_id(run.run_id, sequence),
+                    run_id=run.run_id,
+                    node_id=str(event_data.get("nodeId") or ""),
+                    event_type=str(event_data.get("eventType") or ""),
+                    payload=dict(event_data.get("payload") or {}),
+                    sequence=sequence,
+                )
+                conn.execute(
+                    "INSERT INTO workflow_events VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        event.event_id,
+                        event.run_id,
+                        event.node_id,
+                        event.event_type,
+                        json.dumps(event.payload, ensure_ascii=False),
+                        event.sequence,
+                        event.created_at,
+                    ),
+                )
+            conn.commit()
+            return "updated"
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def get_approval(self, approval_id: str) -> Optional[WorkflowApproval]:
         init_workflow_tables()
@@ -746,9 +1153,20 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
         init_workflow_tables()
         conn = _get_conn()
         conn.execute(
-            """INSERT OR REPLACE INTO workflow_action_records VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )""",
+            """INSERT INTO workflow_action_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(idempotency_key) DO UPDATE SET
+                   action_id=excluded.action_id,
+                   run_id=excluded.run_id,
+                   node_id=excluded.node_id,
+                   action_type=excluded.action_type,
+                   params_json=excluded.params_json,
+                   result_json=excluded.result_json,
+                   status=excluded.status,
+                   error=excluded.error,
+                   created_at=excluded.created_at,
+                   completed_at=excluded.completed_at
+               WHERE workflow_action_records.action_id=excluded.action_id
+                  OR workflow_action_records.status IN ('pending','failed')""",
             (
                 record.action_id,
                 record.run_id,
@@ -1321,26 +1739,76 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             conn.close()
             return False
 
-    def set_run_status_managed(self, run_id: str, status: str, state_dict: Dict[str, Any] = None) -> bool:
-        """driver-managed run 的 wake-only 状态转换（释放 lease + status 变更）。"""
+    def set_run_status_managed(
+        self,
+        run_id: str,
+        status: str,
+        state_dict: Dict[str, Any] = None,
+        *,
+        expected_status: Optional[str] = None,
+        current_node_id: Optional[str] = None,
+        ensure_driver_managed: bool = False,
+        expected_failed_node_run_id: Optional[str] = None,
+        expected_resume_reason: Optional[str] = None,
+    ) -> bool:
+        """Atomically schedule/wake a driver-managed run.
+
+        ``expected_status`` is a lifecycle CAS guard.  Approval, retry, and
+        recovery callers use it so stale commands cannot resurrect a run that
+        concurrently became CANCELLED or COMPLETED.
+        """
         init_workflow_tables()
+        _ensure_wait_columns()
         _ensure_driver_columns()
         conn = _get_conn()
         try:
+            status_guard = " AND status=?" if expected_status is not None else ""
+            suffix: Tuple[Any, ...] = (
+                (expected_status,) if expected_status is not None else ()
+            )
+            if expected_failed_node_run_id:
+                status_guard += (
+                    " AND EXISTS (SELECT 1 FROM workflow_node_runs AS nr"
+                    " WHERE nr.node_run_id=? AND nr.run_id=workflow_runs.run_id"
+                    " AND nr.status IN ('failed','timed_out'))"
+                )
+                suffix = (*suffix, expected_failed_node_run_id)
+            if expected_resume_reason is not None:
+                status_guard += " AND resume_reason=?"
+                suffix = (*suffix, expected_resume_reason)
             if state_dict is not None:
-                conn.execute(
-                    """UPDATE workflow_runs SET status=?, state_json=?, driver_owner=NULL,
-                           driver_lease_until=NULL, updated_at=? WHERE run_id=?""",
-                    (status, json.dumps(state_dict, ensure_ascii=False), _utc_now_iso(), run_id),
+                cursor = conn.execute(
+                    f"""UPDATE workflow_runs SET status=?, state_json=?, driver_owner=NULL,
+                           driver_lease_until=NULL, updated_at=?,
+                           completed_at=CASE WHEN ?='pending' THEN '' ELSE completed_at END,
+                           current_node_id=CASE WHEN ? IS NULL THEN current_node_id ELSE ? END,
+                           driver_managed=CASE WHEN ?=1 THEN 1 ELSE driver_managed END
+                       WHERE run_id=?{status_guard}""",
+                    (
+                        status, json.dumps(state_dict, ensure_ascii=False),
+                        _utc_now_iso(), status,
+                        current_node_id, current_node_id,
+                        1 if ensure_driver_managed else 0,
+                        run_id, *suffix,
+                    ),
                 )
             else:
-                conn.execute(
-                    """UPDATE workflow_runs SET status=?, driver_owner=NULL,
-                           driver_lease_until=NULL, updated_at=? WHERE run_id=?""",
-                    (status, _utc_now_iso(), run_id),
+                cursor = conn.execute(
+                    f"""UPDATE workflow_runs SET status=?, driver_owner=NULL,
+                           driver_lease_until=NULL, updated_at=?,
+                           completed_at=CASE WHEN ?='pending' THEN '' ELSE completed_at END,
+                           current_node_id=CASE WHEN ? IS NULL THEN current_node_id ELSE ? END,
+                           driver_managed=CASE WHEN ?=1 THEN 1 ELSE driver_managed END
+                       WHERE run_id=?{status_guard}""",
+                    (
+                        status, _utc_now_iso(), status,
+                        current_node_id, current_node_id,
+                        1 if ensure_driver_managed else 0,
+                        run_id, *suffix,
+                    ),
                 )
             conn.commit()
-            return True
+            return cursor.rowcount == 1
         finally:
             conn.close()
 
@@ -1476,7 +1944,9 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             raise
 
     def fenced_update_run(self, run_id: str, owner: str, generation: int,
-                          status: str, current_node_id: str, state_dict: Dict[str, Any]) -> bool:
+                          status: str, current_node_id: str, state_dict: Dict[str, Any],
+                          started_at: Optional[str] = None,
+                          completed_at: Optional[str] = None) -> bool:
         """原子 fenced 控制状态写入（owner/generation + lease 有效 CAS）。rowcount==1 才成功。
 
         不覆盖 CANCELLED（terminal-preserving）；lease 已过期不得写（expired worker 停写）。
@@ -1487,11 +1957,14 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
         conn = _get_conn()
         try:
             cur = conn.execute(
-                """UPDATE workflow_runs SET status=?, current_node_id=?, state_json=?, updated_at=?
+                """UPDATE workflow_runs SET status=?, current_node_id=?, state_json=?, updated_at=?,
+                       started_at=CASE WHEN ? IS NULL THEN started_at ELSE ? END,
+                       completed_at=CASE WHEN ? IS NULL THEN completed_at ELSE ? END
                    WHERE run_id=? AND driver_owner=? AND driver_generation=? AND status != 'cancelled'
                      AND driver_lease_until IS NOT NULL AND driver_lease_until >= ?""",
                 (status, current_node_id, json.dumps(state_dict, ensure_ascii=False),
-                 _utc_now_iso(), run_id, owner, generation, now),
+                 _utc_now_iso(), started_at, started_at, completed_at, completed_at,
+                 run_id, owner, generation, now),
             )
             conn.commit()
             return cur.rowcount == 1

@@ -120,12 +120,28 @@ async def execute_action(
     action_type = config.config.get("action_type", "")
     if not action_type:
         return {"error": "action 节点缺少 action_type 配置"}
+    if (state.current_event or {}).get("actionExecutionAllowed") is False:
+        state.add_audit_event("action_replay_blocked", config.node_id, {
+            "actionType": action_type,
+            "reason": "replay run is analysis-only",
+        })
+        return {
+            "action_type": action_type,
+            "status": "denied",
+            "executed": False,
+            "reason": "replay run is analysis-only",
+            "error": "replay run is analysis-only",
+        }
 
     def _driver_gate() -> str:
         """driver-managed execution gate：identity + lease 未过期 + 非 CANCELLED。
 
         返回 'ok' | 'cancelled' | 'lease_lost'。legacy（无 driver context）恒为 'ok'。
         """
+        if repository:
+            durable = repository.get_run(state.workflow_run_id)
+            if durable is not None and durable.status.value == "cancelled":
+                return "cancelled"
         if not repository or not driver_owner:
             return "ok"
         if repository.is_driver_execution_valid(state.workflow_run_id, driver_owner, driver_generation):
@@ -326,6 +342,26 @@ async def execute_action(
     if repository:
         try:
             repository.save_action_record(record)
+            marker = repository.get_action_record_by_idempotency_key(idempotency_key)
+            if marker is None:
+                raise RuntimeError("dispatch marker read-after-write failed")
+            if marker.action_id != action_id:
+                # A concurrent execution already claimed this idempotency key.
+                # The loser must not dispatch.
+                state.add_audit_event("action_idempotent_db_protect", config.node_id, {
+                    "actionType": action_type,
+                    "idempotencyKey": idempotency_key,
+                    "reason": f"existing {marker.status.value} attempt owns marker",
+                })
+                return {
+                    "action_id": marker.action_id,
+                    "action_type": action_type,
+                    "status": "skipped" if marker.status == ActionStatus.SUCCEEDED else "in_flight",
+                    "executed": False,
+                    "reason": "idempotent_db_protect",
+                    **({"error": "existing EXECUTING attempt"}
+                       if marker.status != ActionStatus.SUCCEEDED else {}),
+                }
         except Exception as e:
             state.add_audit_event("dispatch_marker_persist_failed", config.node_id, {
                 "actionType": action_type, "reason": str(e)[:200],
@@ -500,14 +536,20 @@ async def _dispatch_action(
         # 持久化分析结果
         try:
             from backend.tools.db_tools import save_event_analysis
+            # ``save_event_analysis`` consumes the historical analyze-event
+            # envelope, not a flat event DTO.  Passing flat fields here used
+            # to replace an existing canonical row with empty event data on
+            # Workflow completion.  Preserve the authoritative event snapshot
+            # and let canonical lifecycle changes happen only through the
+            # executor's compare-and-set transition.
+            standard_event = dict(event)
             result_data = {
                 "eventId": event.get("eventId", f"evt_{state.workflow_run_id}"),
-                "eventType": event.get("eventType", ""),
-                "eventTypeCn": event.get("eventTypeCn", ""),
-                "roadName": event.get("roadName", ""),
+                "standardEvent": standard_event,
                 "riskScore": risk.get("riskScore", 0),
                 "riskLevel": risk.get("riskLevel", "低风险"),
-                "status": "待派单",
+                "status": event.get("status", "待派单"),
+                "report": getattr(state, "report", "") or "",
             }
             ok = save_event_analysis(result_data)
             return {"saved": bool(ok), "eventId": result_data.get("eventId", "")}

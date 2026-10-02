@@ -89,12 +89,55 @@ export interface WorkflowState {
   currentNode: string;
   status: WorkflowRunStatus;
   attemptCounts: Record<string, number>;
+  completedSteps: string[];
+  retryCount: number;
   pendingApproval: Record<string, unknown> | null;
+  cancelReason: string;
+  cancelledAt: string;
   errors: Array<{ nodeId: string; error: string; attempt: number; timestamp: string }>;
   ragTraceIds: string[];
   agentRunIds: string[];
   approvalIds: string[];
   actionRecordIds: string[];
+  startedAt: string;
+  updatedAt: string;
+  finishedAt: string;
+}
+
+export interface WorkflowRuntimeFailure {
+  nodeId: string | null;
+  message: string;
+  attempt: number;
+  timestamp: string | null;
+}
+
+export interface WorkflowApprovalWaiting {
+  approvalId: string | null;
+  nodeId: string | null;
+  createdAt: string | null;
+  proposedActions: Array<Record<string, unknown>>;
+}
+
+export interface WorkflowRuntimeProjection {
+  eventId: string | null;
+  planId: string | null;
+  currentStep: string | null;
+  completedSteps: string[];
+  retryCount: number;
+  failure: WorkflowRuntimeFailure | null;
+  approvalWaiting: WorkflowApprovalWaiting | null;
+  cancelledAt: string | null;
+  cancelReason: string | null;
+  startedAt: string | null;
+  updatedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface WorkflowRuntimeOperations {
+  canRetry: boolean;
+  canResume: boolean;
+  canCancel: boolean;
+  retryNodeId: string | null;
 }
 
 export interface WorkflowNodeRun {

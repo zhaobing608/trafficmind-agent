@@ -17,6 +17,7 @@ import asyncio
 import os
 import sqlite3
 import time
+import uuid
 from datetime import datetime, timezone
 
 import backend.config as _config
@@ -67,7 +68,9 @@ class WaitScheduler:
         if self._running:
             return
         self._running = True
-        self._stop_event.clear()
+        # A process-level singleton can be restarted by a new ASGI event loop;
+        # never reuse the loop-bound Event from a previous lifespan.
+        self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(self._scan_loop())
         print(f"[WaitScheduler] 启动，扫描间隔 {_WAIT_SCAN_INTERVAL_SECONDS}s")
 
@@ -83,6 +86,8 @@ class WaitScheduler:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            finally:
+                self._task = None
         print("[WaitScheduler] 已停止")
 
     async def _scan_loop(self):
@@ -111,19 +116,21 @@ class WaitScheduler:
         try:
             now_iso = _utc_now_iso()
             now_unix = _utc_now_unix()
+            claim_token = f"wait_claim_{uuid.uuid4().hex}"
 
             # ── Claim 到期 runs ──────────────────────────────────────
             # 原子 UPDATE：将 waiting 状态改为 claimed，设置 claim 时间
             cursor = conn.execute(
                 """UPDATE workflow_runs
                    SET status = 'claimed',
-                       updated_at = ?
+                       updated_at = ?,
+                       resume_reason = ?
                    WHERE status = 'paused'
                      AND wait_type IS NOT NULL
                      AND wait_type != ''
                      AND wake_at IS NOT NULL
                      AND wake_at <= ?""",
-                (now_iso, now_iso),
+                (now_iso, claim_token, now_iso),
             )
             conn.commit()
             claimed_count = cursor.rowcount
@@ -134,16 +141,21 @@ class WaitScheduler:
             # ── 获取已 claim 的 runs ─────────────────────────────────
             rows = conn.execute(
                 """SELECT run_id FROM workflow_runs
-                   WHERE status = 'claimed'
+                   WHERE status = 'claimed' AND resume_reason = ?
                    ORDER BY wake_at ASC
-                   LIMIT 50"""
+                   LIMIT 50""",
+                (claim_token,),
             ).fetchall()
 
             for row in rows:
                 run_id = row["run_id"]
                 try:
                     print(f"[WaitScheduler] Resuming {run_id}...")
-                    await self._resume_waiting_run(run_id)
+                    await self._resume_waiting_run(
+                        run_id,
+                        require_claimed=True,
+                        claim_token=claim_token,
+                    )
                     print(f"[WaitScheduler] Resumed {run_id} OK")
                 except Exception as e:
                     import traceback
@@ -154,7 +166,7 @@ class WaitScheduler:
                         """UPDATE workflow_runs
                            SET status = 'failed',
                                updated_at = ?
-                           WHERE run_id = ?""",
+                           WHERE run_id = ? AND status = 'claimed'""",
                         (now_iso, run_id),
                     )
                     conn.commit()
@@ -178,7 +190,13 @@ class WaitScheduler:
         finally:
             conn.close()
 
-    async def _resume_waiting_run(self, run_id: str):
+    async def _resume_waiting_run(
+        self,
+        run_id: str,
+        *,
+        require_claimed: bool = False,
+        claim_token: str = "",
+    ):
         """恢复一个到期等待的 Run。
 
         注入已等待标记到 state，使 wait 节点识别为恢复场景直接跳过。
@@ -207,30 +225,48 @@ class WaitScheduler:
             "wait_skipped": True, "status": "already_waited",
             "resumed_by": "scheduler", "resumed_at": _utc_now_iso(),
         }
-        state.status = WorkflowRunStatus("paused")  # 恢复为 paused 以便 resume() 接受
-        run.state = state.to_dict()
-        run.status = state.status
-        repo.save_run(run)
-
-        # 同时更新 DB 中的 status 为 paused
-        conn = _get_conn()
-        try:
-            conn.execute(
-                "UPDATE workflow_runs SET status = 'paused', updated_at = ? WHERE run_id = ?",
-                (_utc_now_iso(), run_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        source_status = "claimed" if require_claimed else "paused"
+        persisted_state = run.state if isinstance(run.state, dict) else {}
+        from backend.planning.budget import LINEAGE_KEY
 
         # ── 恢复运行 ──────────────────────────────────────────────
         # Phase17 Round3: planning driver-managed run → wake-only（PENDING + release lease），
         # 由 RunDriver pickup + execute；不在此 request 内长期执行。
         if repo.is_driver_managed(run_id):
             state.status = WorkflowRunStatus("pending")
-            repo.set_run_status_managed(run_id, "pending", state.to_dict())
+            next_state = state.to_dict()
+            if persisted_state.get(LINEAGE_KEY):
+                next_state[LINEAGE_KEY] = persisted_state[LINEAGE_KEY]
+            updated = repo.set_run_status_managed(
+                run_id,
+                "pending",
+                next_state,
+                expected_status=source_status,
+                current_node_id=state.current_node,
+                ensure_driver_managed=True,
+                expected_resume_reason=claim_token if require_claimed else None,
+            )
+            if not updated:
+                return
             return
 
+        # Legacy runs still resume in-process, but the scheduler first performs
+        # a status CAS.  A concurrent cancellation therefore wins and no call
+        # to executor.resume() is made.
+        state.status = WorkflowRunStatus("paused")
+        next_state = state.to_dict()
+        if persisted_state.get(LINEAGE_KEY):
+            next_state[LINEAGE_KEY] = persisted_state[LINEAGE_KEY]
+        updated = repo.set_run_status_managed(
+            run_id,
+            "paused",
+            next_state,
+            expected_status=source_status,
+            current_node_id=state.current_node,
+            expected_resume_reason=claim_token if require_claimed else None,
+        )
+        if not updated:
+            return
         executor = WorkflowExecutor(repo)
         async for _ in executor.resume(run_id):
             pass  # SSE 事件通过 executor 持久化到 Event 表

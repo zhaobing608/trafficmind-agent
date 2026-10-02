@@ -12,7 +12,7 @@
  *   ?view=workflow&workflowRunId=<id>     → running
  */
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { listDefinitions, startRun, getRun, resumeRun, cancelRun, retryNode, processApproval, getRunStream } from '../../api/workflowApi';
+import { listDefinitions, startRun, getRun, getRunStream } from '../../api/workflowApi';
 import { WorkflowTracePanel } from './WorkflowTracePanel';
 import { WorkflowErrorBoundary } from './WorkflowErrorBoundary';
 import { WorkflowRunHistory } from './WorkflowRunHistory';
@@ -84,8 +84,6 @@ export const WorkflowWorkspace: React.FC<Props> = ({ workflowRunId, sessionId, o
   const [traceRefreshKey, setTraceRefreshKey] = useState(0);
   const selectionRef = useRef(workflowRunId);
   selectionRef.current = workflowRunId;
-  const [statusRunId, setStatusRunId] = useState<string | null>(null);
-
   const abortRef = useRef<AbortController | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -101,6 +99,7 @@ export const WorkflowWorkspace: React.FC<Props> = ({ workflowRunId, sessionId, o
           if (serverStatus !== prev) setTraceRefreshKey(k => k + 1);
           return serverStatus;
         });
+        setError(null);
         if (!POLLABLE.has(serverStatus)) stopPolling();
       } catch { /* retry on next interval */ }
     }, POLL_INTERVAL_MS);
@@ -148,35 +147,46 @@ export const WorkflowWorkspace: React.FC<Props> = ({ workflowRunId, sessionId, o
       onEvent: (_eventType, data) => {
         if (controller.signal.aborted || selectionRef.current !== runId) return;
         setTraceRefreshKey(k => k + 1);
-        setStatusRunId(runId);
         const status = data.status as string | undefined;
         if (_eventType === 'run_status' && status) setRunStatus(status);
       },
+      onError: (message) => {
+        if (controller.signal.aborted || selectionRef.current !== runId) return;
+        setError(message || '执行状态流不可用，正在重新确认服务端状态');
+      },
       onDone: (status) => {
         if (controller.signal.aborted || selectionRef.current !== runId) return;
-        if (status !== 'interrupted') { setRunStatus(status); setStatusRunId(runId); }
+        if (status === 'interrupted') {
+          setError('执行状态流中断，正在重新确认服务端状态');
+          void getRun(runId).then(detail => {
+            if (controller.signal.aborted || selectionRef.current !== runId) return;
+            const serverStatus = detail.run.status;
+            setRunStatus(serverStatus);
+            setTraceRefreshKey(k => k + 1);
+            setError(null);
+            maybeStartPolling(runId, serverStatus);
+          }).catch(() => {
+            if (controller.signal.aborted || selectionRef.current !== runId) return;
+            // Keep retrying durable server truth after a transient recovery
+            // read failure; do not leave the workspace frozen indefinitely.
+            startPolling(runId);
+          });
+          return;
+        }
+        setRunStatus(status);
         maybeStartPolling(runId, status);
       },
-    }, controller.signal).catch(() => {});
-    return controller;
-  }, [maybeStartPolling]);
-
-  const streamResume = useCallback((runId: string) => {
-    if (abortRef.current) abortRef.current.abort();
-    stopPolling();
-    const controller = new AbortController(); abortRef.current = controller;
-    resumeRun(runId, {
-      onEvent: (eventType, data) => {
-        if (controller.signal.aborted || selectionRef.current !== runId) return;
-        const status = (data.status as string) || eventType.replace('workflow_', '');
-        setRunStatus(status); setTraceRefreshKey(k => k + 1);
-      },
-      onError: (msg) => { if (!controller.signal.aborted && selectionRef.current === runId) setError(msg); },
-      onDone: (status) => { if (!controller.signal.aborted && selectionRef.current === runId) { setTraceRefreshKey(k => k + 1); maybeStartPolling(runId, status); } },
-    }, controller.signal).catch((err: unknown) => {
-      if (err instanceof Error && err.name !== 'AbortError') setError(err.message);
+    }, controller.signal).catch((streamError: unknown) => {
+      if (controller.signal.aborted || selectionRef.current !== runId) return;
+      setError(
+        streamError instanceof Error && streamError.message
+          ? `执行状态流中断：${streamError.message}`
+          : '执行状态流中断，正在重新确认服务端状态',
+      );
+      startPolling(runId);
     });
-  }, [maybeStartPolling, stopPolling]);
+    return controller;
+  }, [maybeStartPolling, startPolling]);
 
   // ── Template handlers (unchanged) ──
   const handleSelectTemplate = useCallback((defId: string) => {
@@ -234,48 +244,6 @@ export const WorkflowWorkspace: React.FC<Props> = ({ workflowRunId, sessionId, o
       setCreating(false);
     }
   }, [selectedDefId, formValues, sessionId, onRunIdChange, stopPolling, maybeStartPolling, runStatus, workflowRunId]);
-
-  // ── Approval / Cancel / Retry (unchanged) ──
-  const handleApprove = useCallback(async (approvalId: string, comment: string) => {
-    if (!workflowRunId) return;
-    await processApproval(workflowRunId, approvalId, { action: 'approve', comment });
-    streamResume(workflowRunId);
-  }, [workflowRunId, streamResume]);
-
-  const handleReject = useCallback(async (approvalId: string, comment: string) => {
-    if (!workflowRunId) return;
-    await processApproval(workflowRunId, approvalId, { action: 'reject', comment });
-    setRunStatus('rejected'); stopPolling(); setTraceRefreshKey(k => k + 1);
-  }, [workflowRunId, stopPolling]);
-
-  const handleEditAndApprove = useCallback(async (approvalId: string, editedActions: Array<Record<string, unknown>>, comment: string) => {
-    if (!workflowRunId) return;
-    await processApproval(workflowRunId, approvalId, { action: 'edit_and_approve', editedActions, comment });
-    streamResume(workflowRunId);
-  }, [workflowRunId, streamResume]);
-
-  const handleCancel = useCallback(async () => {
-    if (!workflowRunId) return;
-    stopPolling();
-    try {
-      await cancelRun(workflowRunId);
-      if (selectionRef.current !== workflowRunId) return;
-      setRunStatus('cancelled'); setTraceRefreshKey(k => k + 1);
-    } catch (e: unknown) {
-      try {
-        const detail = await getRun(workflowRunId);
-        if (selectionRef.current !== workflowRunId) return;
-        setRunStatus((detail.run as Record<string,unknown>).status as string);
-        setTraceRefreshKey(k => k + 1);
-      } catch { setError(e instanceof Error ? e.message : 'Cancel failed'); }
-    }
-  }, [workflowRunId, stopPolling]);
-
-  const handleRetry = useCallback(async (nodeId: string) => {
-    if (!workflowRunId) return;
-    try { await retryNode(workflowRunId, nodeId); setTraceRefreshKey(k => k + 1); }
-    catch (e: unknown) { setError(e instanceof Error ? e.message : 'Retry failed'); }
-  }, [workflowRunId]);
 
   // Back from running → center
   const handleBackToCenter = useCallback(() => {
@@ -455,14 +423,6 @@ export const WorkflowWorkspace: React.FC<Props> = ({ workflowRunId, sessionId, o
             )}
             {!isTerminal && pollTimerRef.current && (
               <span style={{ fontSize: 10, color: '#9CA3AF' }}>⟳ 自动检测状态变化</span>
-            )}
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            {statusRunId === workflowRunId && !isTerminal && (
-              <button onClick={handleCancel}
-                style={{ padding: '4px 12px', borderRadius: 6, border: '1px solid #FCA5A5', background: '#FFF', color: '#DC2626', cursor: 'pointer', fontSize: 12 }}>
-                取消
-              </button>
             )}
           </div>
         </div>

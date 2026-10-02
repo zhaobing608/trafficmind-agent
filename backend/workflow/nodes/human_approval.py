@@ -11,6 +11,7 @@ human_approval 节点 — 人工审批。
 未经批准不得执行外部 action 节点。
 """
 
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 from backend.workflow.models import (
@@ -135,6 +136,7 @@ async def execute_human_approval(
         "decision": ApprovalDecision.PENDING.value,
         "reviewer": "",
         "comment": "",
+        "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "context": {
             "riskLevel": risk.get("riskLevel", "未知"),
             "riskScore": risk.get("riskScore", 0),

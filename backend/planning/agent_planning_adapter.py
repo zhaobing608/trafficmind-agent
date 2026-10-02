@@ -105,6 +105,7 @@ def build_planning_input_from_agent(
         "collaborationRunId": collaboration_run_id,
         "selectedAgents": selected_agents,
         "finalStatus": run.get("status", ""),
+        "runKind": normalized_event.get("runKind", "live"),
     }
     if grounding_audit:
         source_agent["groundingStatus"] = grounding_audit.get("groundingStatus", "MINIMAL")
@@ -120,6 +121,9 @@ def build_planning_input_from_agent(
         "agentFindings": findings,
         "agentRecommendations": recommendations,
         "agentRecommendationAudit": recommendation_audit,
+        "actionExecutionAllowed": bool(
+            normalized_event.get("actionExecutionAllowed", True)
+        ),
     }
     if final_decision:
         constraints["agentFinalDecision"] = final_decision
@@ -130,6 +134,12 @@ def build_planning_input_from_agent(
         "eventSnapshot": event,
         "sourceAgent": source_agent,
         "agentRecommendationAudit": recommendation_audit,
+        "runKind": normalized_event.get("runKind", "live"),
+        "replayId": normalized_event.get("replayId", ""),
+        "replayOfEventId": normalized_event.get("replayOfEventId", ""),
+        "actionExecutionAllowed": bool(
+            normalized_event.get("actionExecutionAllowed", True)
+        ),
     }
     if grounding_audit:
         plan_metadata["agentGroundingAudit"] = grounding_audit

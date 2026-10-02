@@ -56,7 +56,10 @@ class RunDriver:
         if self._running:
             return
         self._running = True
-        self._stop_event.clear()
+        # TestClient and embedded ASGI hosts may start the same process-level
+        # singleton on a fresh event loop.  asyncio.Event is loop-bound after
+        # its first wait, so create a new lifecycle primitive per start.
+        self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(self._poll_loop())
         print(f"[RunDriver] 启动，owner={self._owner}，poll={self._poll_interval}s")
 
@@ -71,6 +74,8 @@ class RunDriver:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            finally:
+                self._task = None
         print("[RunDriver] 已停止")
 
     async def _poll_loop(self) -> None:
@@ -284,12 +289,7 @@ class RunDriver:
         return lineage.rootRunId or run.run_id
 
     def _emit_recovery_event(self, run_id: str, event_type: str, payload: Dict[str, Any]) -> None:
-        from backend.workflow.models import WorkflowEvent
-        evt = WorkflowEvent(
-            event_id=f"wfevent_{event_type}_{payload.get('recoveryAttemptId', uuid.uuid4().hex)}",
-            run_id=run_id, event_type=event_type, payload=payload, sequence=0,
-        )
-        self._repo.save_event(evt)
+        self._repo.append_event(run_id, event_type, payload=payload)
 
 
 # ── 全局单例 ──────────────────────────────────────────────────────────────
