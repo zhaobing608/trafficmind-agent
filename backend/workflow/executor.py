@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 
 from backend.workflow.models import (
+    ActionStatus,
     ApprovalDecision,
     NodeConfig,
     NodeStatus,
@@ -61,6 +62,7 @@ from backend.workflow.condition import (
 from backend.workflow.nodes.base import get_node_registry
 from backend.workflow.nodes import register_all_nodes
 from backend.workflow.errors import DriverLeaseLost
+from backend.workflow.action_execution import contains_sensitive_key
 
 
 def _utc_now_iso() -> str:
@@ -81,13 +83,19 @@ def definition_allows_action_execution(definition: WorkflowDefinition) -> bool:
     """
     metadata = definition.metadata if isinstance(definition.metadata, dict) else {}
     policy_values = [metadata.get("actionExecutionAllowed")]
+    run_kinds = [metadata.get("runKind")]
     plan = metadata.get("plan")
     if isinstance(plan, dict):
         policy_values.append(plan.get("actionExecutionAllowed"))
+        run_kinds.append(plan.get("runKind"))
         plan_metadata = plan.get("metadata")
         if isinstance(plan_metadata, dict):
             policy_values.append(plan_metadata.get("actionExecutionAllowed"))
-    return not any(value is False for value in policy_values)
+            run_kinds.append(plan_metadata.get("runKind"))
+    return not (
+        any(value is False for value in policy_values)
+        or any(str(value or "").lower() == "replay" for value in run_kinds)
+    )
 
 
 def _apply_definition_action_policy(
@@ -168,6 +176,14 @@ class WorkflowExecutor:
         issues = self._def_manager.validate_for_execution(definition)
         if issues:
             yield sse_event("error", {"message": f"Definition 不可执行: {'; '.join(issues)}"})
+            yield sse_event("done", {"error": True})
+            return
+
+        from backend.workflow.action_execution import contains_sensitive_key
+        if contains_sensitive_key(initial_event or {}):
+            yield sse_event("error", {
+                "message": "Workflow event 不允许包含 credential/secret 字段"
+            })
             yield sse_event("done", {"error": True})
             return
 
@@ -268,6 +284,16 @@ class WorkflowExecutor:
                 "message": f"Run '{run_id}' 状态为 {state.status.value}，无法恢复"
             })
             yield sse_event("done", {"error": True})
+            return
+
+        if any(
+            action.status == ActionStatus.UNKNOWN
+            for action in self.repo.list_action_records(run_id)
+        ):
+            yield sse_event("error", {
+                "message": "Run 存在 UNKNOWN Action，必须先 reconciliation，不能直接 resume"
+            })
+            yield sse_event("done", {"runId": run_id, "status": state.status.value, "error": True})
             return
 
         if state.status == WorkflowRunStatus.AWAITING_APPROVAL and state.pending_approval:
@@ -420,6 +446,14 @@ class WorkflowExecutor:
             "cancelledAt": state.cancelled_at,
             "compensationPerformed": False,
         }, seq)
+        # A durable dispatch marker means the request may already have reached
+        # its provider.  Cancellation owns Workflow control, but it must not
+        # erase that uncertainty or strand the Action as RUNNING forever.
+        for action_record in self.repo.list_executing_action_records(run_id):
+            self.repo.mark_running_action_unknown_and_pause(
+                action_record.action_id,
+                reason="run cancelled after dispatch; external outcome unknown",
+            )
         return {
             "runId": run_id,
             "status": "cancelled",
@@ -460,6 +494,14 @@ class WorkflowExecutor:
         edited_actions: list = None, reviewer: str = "", comment: str = "",
         expected_approval_id: str = "",
     ) -> Dict[str, Any]:
+        if (
+            decision == ApprovalDecision.EDITED
+            and contains_sensitive_key(edited_actions or [])
+        ):
+            return {
+                "error": "审批编辑内容包含禁止持久化的 credential/secret 字段",
+                "errorCode": "invalid_parameters",
+            }
         run = self.repo.get_run(run_id)
         if run is None:
             return {"error": f"Run '{run_id}' 不存在", "errorCode": "not_found"}
@@ -476,6 +518,19 @@ class WorkflowExecutor:
         pending = state.pending_approval
         if not pending:
             return {"error": "没有待处理的审批", "errorCode": "approval_not_pending"}
+        approval_actions = (
+            (edited_actions or [])
+            if decision == ApprovalDecision.EDITED
+            else pending.get("proposedActions", [])
+        )
+        if (
+            decision in {ApprovalDecision.APPROVED, ApprovalDecision.EDITED}
+            and contains_sensitive_key(approval_actions)
+        ):
+            return {
+                "error": "审批内容包含禁止持久化的 credential/secret 字段",
+                "errorCode": "invalid_parameters",
+            }
 
         approval_id = pending.get("approvalId", "")
         if expected_approval_id and expected_approval_id != approval_id:
@@ -617,6 +672,21 @@ class WorkflowExecutor:
                 "scheduled": False, "legacyRecordOnly": True,
             }
 
+        # UNKNOWN is a distinct safety state, not a failed node.  Surface the
+        # reconciliation requirement even through the legacy node-retry API so
+        # callers cannot mistake a paused ambiguous side effect for an ordinary
+        # retryable failure.
+        unknown_actions = [
+            action for action in self.repo.list_action_records(run_id)
+            if action.node_id == node_id and action.status == ActionStatus.UNKNOWN
+        ]
+        if unknown_actions:
+            return {
+                "error": "UNKNOWN Action 禁止直接 retry；必须先 reconciliation",
+                "errorCode": "reconcile_required",
+                "actionExecutionId": unknown_actions[-1].action_id,
+            }
+
         if state.status != WorkflowRunStatus.FAILED:
             return {
                 "error": f"Run '{run_id}' 状态为 {state.status.value}，仅 failed 可重试",
@@ -638,11 +708,37 @@ class WorkflowExecutor:
         definition = self._def_manager.get_definition_at_version(
             run.definition_id, run.version
         )
-        if definition is None or definition.get_node(node_id) is None:
+        node_config = definition.get_node(node_id) if definition is not None else None
+        if definition is None or node_config is None:
             return {
                 "error": f"Run '{run_id}' 的版本化节点 '{node_id}' 不存在",
                 "errorCode": "definition_not_found",
             }
+
+        # Action retries use the stricter execution-state CAS.  UNKNOWN is
+        # never routed here (the run is PAUSED); known FAILED attempts are
+        # moved to PENDING together with the Workflow in one transaction.
+        if node_config.node_type == NodeType.ACTION:
+            action_records = [
+                item for item in self.repo.list_action_records(run_id)
+                if item.node_id == node_id
+            ]
+            action_records.sort(key=lambda item: (item.attempt, item.created_at, item.action_id))
+            if action_records:
+                from backend.workflow.action_execution import request_action_execution_retry
+                result = request_action_execution_retry(
+                    self.repo,
+                    run_id,
+                    action_records[-1].action_id,
+                )
+                if result.get("error"):
+                    return result
+                return {
+                    **result,
+                    "nodeId": node_id,
+                    "attempt": int(result.get("nextAttempt") or latest_failed.attempt + 1),
+                    "runStatus": "pending",
+                }
 
         state.retry_count += 1
         state.current_node = node_id
@@ -876,11 +972,32 @@ class WorkflowExecutor:
                     return
                 else:
                     # 外部事件等待：关闭 SSE 流，等待外部 resume
+                    paused_result = node_result.get("result") if isinstance(node_result, dict) else {}
+                    action_unknown = (
+                        node_config.node_type == NodeType.ACTION
+                        and isinstance(paused_result, dict)
+                        and paused_result.get("status") == "unknown"
+                    )
+                    pause_reason = (
+                        "Action 执行结果待确认；请先 reconciliation，禁止直接重试"
+                        if action_unknown
+                        else wait_config.get("event_name", "等待外部事件")
+                    )
                     yield sse_event("workflow_paused", {
                         "runId": run.run_id,
                         "currentNodeId": current_node_id,
-                        "reason": wait_config.get("event_name", "等待外部事件"),
+                        "reason": pause_reason,
+                        "actionExecutionId": (
+                            paused_result.get("actionExecutionId") if action_unknown else None
+                        ),
                     })
+                    self._save_event(run.run_id, "workflow_paused", current_node_id, {
+                        "reason": pause_reason,
+                        "actionExecutionId": (
+                            paused_result.get("actionExecutionId") if action_unknown else None
+                        ),
+                    }, seq)
+                    seq += 1
                     yield sse_event("done", {"runId": run.run_id, "status": "paused"})
                     return
 
@@ -1060,6 +1177,7 @@ class WorkflowExecutor:
         last_error = ""
         result: Dict[str, Any] = {}
         succeeded = False
+        unknown_action = False
         terminal_attempt = first_attempt
 
         for local_attempt in range(1, max(1, node_config.max_attempts) + 1):
@@ -1100,6 +1218,7 @@ class WorkflowExecutor:
 
             attempt_error = ""
             timed_out = False
+            action_finalization: Optional[Dict[str, Any]] = None
             try:
                 executor_fn = registry.get(node_type)
                 if executor_fn is None:
@@ -1112,6 +1231,7 @@ class WorkflowExecutor:
                             repository=self._repo,
                             driver_owner=self._driver_owner,
                             driver_generation=self._driver_generation,
+                            defer_terminal=True,
                         ),
                         timeout=node_config.timeout_seconds,
                     )
@@ -1122,20 +1242,31 @@ class WorkflowExecutor:
                     )
 
                 if isinstance(result, dict):
+                    raw_finalization = result.pop("_actionFinalization", None)
+                    if isinstance(raw_finalization, dict):
+                        action_finalization = raw_finalization
                     result_status = str(result.get("status") or "")
                     if result_status == "cancelled":
                         raise WorkflowRunCancelled(run.run_id)
                     if result_status == "lease_lost":
                         raise DriverLeaseLost(run.run_id)
                     if result.get("error"):
-                        raise RuntimeError(str(result["error"]))
+                        if result_status != "unknown":
+                            raise RuntimeError(str(result["error"]))
+                    if result_status == "unknown":
+                        unknown_action = True
+                        attempt_error = str(
+                            result.get("error")
+                            or result.get("reason")
+                            or "Action 外部执行结果待确认"
+                        )[:500]
                     if result_status in {
                         "failed", "timed_out", "denied", "approval_required",
                         "budget_exhausted", "marker_persist_failed",
                         "result_persist_failed", "in_flight",
                     }:
                         raise RuntimeError(str(result.get("reason") or result_status))
-                succeeded = True
+                succeeded = not unknown_action
             except (WorkflowRunCancelled, DriverLeaseLost):
                 # Leave the durable attempt RUNNING: its completion is unknown
                 # to this worker and cancellation/lease ownership won the race.
@@ -1143,15 +1274,84 @@ class WorkflowExecutor:
             except asyncio.TimeoutError:
                 timed_out = True
                 attempt_error = f"节点执行超时 ({node_config.timeout_seconds}s)"
+                if node_config.node_type == NodeType.ACTION:
+                    # ``asyncio.wait_for`` cancels execute_action first.  The
+                    # reliable action layer turns that post-marker cancellation
+                    # into a durable UNKNOWN before TimeoutError reaches us.
+                    # Project that durable fact into the node/run checkpoint so
+                    # the Workflow pauses instead of being mislabelled FAILED.
+                    durable_actions = [
+                        action
+                        for action in self.repo.list_action_records(run.run_id)
+                        if action.node_id == node_id
+                    ]
+                    durable_actions.sort(
+                        key=lambda action: (
+                            action.attempt,
+                            action.created_at,
+                            action.action_id,
+                        )
+                    )
+                    latest_action = durable_actions[-1] if durable_actions else None
+                    if (
+                        latest_action is not None
+                        and latest_action.status == ActionStatus.UNKNOWN
+                    ):
+                        timed_out = False
+                        unknown_action = True
+                        result = {
+                            "actionExecutionId": latest_action.action_id,
+                            "actionType": latest_action.action_type,
+                            "attempt": latest_action.attempt,
+                            "status": ActionStatus.UNKNOWN.value,
+                            "error": latest_action.error or attempt_error,
+                            "externalReference": (
+                                latest_action.external_reference or None
+                            ),
+                            "reconciliationSupported": bool(
+                                latest_action.reconciliation_supported
+                            ),
+                            "retryable": False,
+                        }
             except Exception as exc:
                 attempt_error = str(exc)[:500]
 
             # Cancellation and fencing are checked before *every* terminal node
             # write, including failed attempts that may be retried locally.
-            self._assert_execution_active(run.run_id)
+            try:
+                self._assert_execution_active(run.run_id)
+            except (WorkflowRunCancelled, DriverLeaseLost):
+                # The side effect already returned a factual terminal/UNKNOWN
+                # result.  Persist that attempt without advancing the node or
+                # Run; cancellation/fencing still owns control flow.
+                if action_finalization is not None:
+                    self.repo.finalize_action_execution(action_finalization)
+                raise
             node_run.completed_at = _utc_now_iso()
             node_run.duration_ms = int((time.monotonic() - started_monotonic) * 1000)
             node_run.output_snapshot = result if isinstance(result, dict) else {}
+
+            if unknown_action:
+                node_run.status = NodeStatus.PAUSED
+                node_run.error = attempt_error
+                state.node_outputs[node_id] = result if isinstance(result, dict) else {}
+                state.current_node = node_id
+                state.transition(WorkflowRunStatus.PAUSED)
+                self._prepare_run_checkpoint(run, state)
+                self._finalize_node_attempt(
+                    node_run,
+                    checkpoint_run=run,
+                    action_finalization=action_finalization,
+                )
+                sse_events.append(sse_event_fn("action_unknown", {
+                    "runId": run.run_id,
+                    "nodeId": node_id,
+                    "actionExecutionId": result.get("actionExecutionId") if isinstance(result, dict) else None,
+                    "attempt": absolute_attempt,
+                    "status": "unknown",
+                    "message": "Action 执行结果待确认，Workflow 已安全暂停",
+                }))
+                break
 
             if succeeded:
                 if node_config.node_type != NodeType.TRIGGER:
@@ -1168,7 +1368,11 @@ class WorkflowExecutor:
                 # represents must become durable together.  Otherwise recovery
                 # would skip the node while losing outputs/risk/approval state.
                 self._prepare_run_checkpoint(run, state)
-                self._finalize_node_attempt(node_run, checkpoint_run=run)
+                self._finalize_node_attempt(
+                    node_run,
+                    checkpoint_run=run,
+                    action_finalization=action_finalization,
+                )
                 sse_events.append(sse_event_fn("node_completed", {
                     "runId": run.run_id,
                     "nodeId": node_id,
@@ -1187,9 +1391,18 @@ class WorkflowExecutor:
             state.record_error(node_id, last_error, absolute_attempt)
             node_run.status = NodeStatus.TIMED_OUT if timed_out else NodeStatus.FAILED
             node_run.error = last_error
-            self._finalize_node_attempt(node_run)
+            self._finalize_node_attempt(
+                node_run,
+                action_finalization=action_finalization,
+            )
 
-            if local_attempt < max(1, node_config.max_attempts):
+            if (
+                local_attempt < max(1, node_config.max_attempts)
+                and not (
+                    node_config.node_type == NodeType.ACTION
+                    and action_finalization is not None
+                )
+            ):
                 if not reserve_retry_durable(self.repo, run.run_id):
                     last_error = "retry budget exhausted"
                     state.record_error(node_id, last_error, absolute_attempt)
@@ -1215,7 +1428,7 @@ class WorkflowExecutor:
         if should_count_step(node_config.node_type):
             reserve_step_durable(self.repo, run.run_id)
 
-        if not succeeded:
+        if not succeeded and not unknown_action:
             sse_events.append(sse_event_fn("node_failed", {
                 "runId": run.run_id,
                 "nodeId": node_id,
@@ -1330,6 +1543,7 @@ class WorkflowExecutor:
         node_run: WorkflowNodeRun,
         *,
         checkpoint_run: Optional[WorkflowRun] = None,
+        action_finalization: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Conditionally close a durable attempt without losing a cancel race."""
         ok = self.repo.finalize_node_run(
@@ -1337,6 +1551,7 @@ class WorkflowExecutor:
             driver_owner=self._driver_owner,
             driver_generation=self._driver_generation,
             checkpoint_run=checkpoint_run,
+            action_finalization=action_finalization,
         )
         if ok:
             return

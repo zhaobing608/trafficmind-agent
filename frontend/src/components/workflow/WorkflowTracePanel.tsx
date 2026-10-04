@@ -5,14 +5,21 @@ import {
   getRunTrace, getRun, type WorkflowTrace, type WorkflowRunDetail,
 } from '../../api/workflowApi';
 import { RUN_STATUS_COLORS, RUN_STATUS_LABELS } from '../../types/workflow';
-import type { WorkflowRunStatus, NodeType, NodeStatus } from '../../types/workflow';
+import type { WorkflowRunStatus, NodeType, NodeStatus, WorkflowActionRecord } from '../../types/workflow';
 import { WorkflowRunTimeline } from './WorkflowRunTimeline';
 import { WorkflowNodeCard } from './WorkflowNodeCard';
 import { WorkflowObservabilityView } from './WorkflowObservabilityView';
 import { WorkflowApprovalCard } from './WorkflowApprovalCard';
 import { WorkflowActionRecordCard } from './WorkflowActionRecordCard';
 import { WorkflowErrorBoundary } from './WorkflowErrorBoundary';
-import { cancelRun, processApproval, resumeRun, retryNode } from '../../api/workflowApi';
+import {
+  cancelRun,
+  processApproval,
+  reconcileAction,
+  resumeRun,
+  retryAction,
+  retryNode,
+} from '../../api/workflowApi';
 import { workflowTemplateVersionLabel } from '../../utils/display';
 import { getPlan } from '../../api/planningApi';
 import type { PlanDetail } from '../../types/planning';
@@ -169,15 +176,10 @@ export const WorkflowTracePanel: React.FC<Props> = ({ runId, visible = true, onR
     completedAt: (nr.completedAt as string) || '',
   }));
 
-  const actionRecords = (trace?.actionRecords || [])
-    .map((a: Record<string, unknown>) => ({
-      actionId: a.actionId as string, runId: a.runId as string,
-      nodeId: a.nodeId as string, actionType: a.actionType as string,
-      idempotencyKey: a.idempotencyKey as string,
-      status: a.status as string || 'unknown',
-      error: a.error as string || '', result: a.result as Record<string, unknown> || {},
-      createdAt: a.createdAt as string || '', completedAt: a.completedAt as string || '',
-    }));
+  // Action state changes independently while a Run remains PAUSED.  The Run
+  // detail is the authoritative snapshot; trace may lag reconciliation.
+  const actionRecords = (detail.actionRecords || []) as WorkflowActionRecord[];
+  const unknownActions = actionRecords.filter(action => action.status === 'unknown');
 
   const state = detail?.state || {};
   let pendingApproval: Record<string, unknown> | null = null;
@@ -202,6 +204,32 @@ export const WorkflowTracePanel: React.FC<Props> = ({ runId, visible = true, onR
           description={`${runtime.failure.message}${runtime.failure.attempt ? `（第 ${runtime.failure.attempt} 次尝试）` : ''}`}
         />
       )}
+      {unknownActions.map(action => (
+        <Alert
+          key={`unknown-${action.actionExecutionId}`}
+          type="warning"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={`执行结果待确认：${action.actionType}`}
+          description={(
+            <div>
+              <div>请求可能已到达外部系统；确认前不会再次执行。第 {action.attempt || 1} 次尝试
+                {action.externalReference ? `，外部引用 ${action.externalReference}` : ''}。</div>
+              {action.operations?.canReconcile ? (
+                <button
+                  disabled={operationPending}
+                  onClick={() => void runOperation(() => reconcileAction(runId, action.actionExecutionId))}
+                  style={{ marginTop: 8, padding: '6px 12px', borderRadius: 6, border: '1px solid #D97706', background: '#FFFBEB', color: '#92400E' }}
+                >
+                  确认外部执行结果
+                </button>
+              ) : (
+                <div style={{ marginTop: 6 }}>该通道不支持自动确认，请人工核验。</div>
+              )}
+            </div>
+          )}
+        />
+      ))}
       {status === 'cancelled' && runtime?.cancelReason && (
         <Alert type="info" style={{ marginBottom: 12 }} message="流程已取消" description={runtime.cancelReason} />
       )}
@@ -292,8 +320,14 @@ export const WorkflowTracePanel: React.FC<Props> = ({ runId, visible = true, onR
             key: 'actions',
             label: `动作 (${actionRecords.length})`,
             children: actionRecords.length > 0 ? (
-              actionRecords.map((ar, i) => (
-                <WorkflowActionRecordCard key={i} {...ar} />
+              actionRecords.map(ar => (
+                <WorkflowActionRecordCard
+                  key={ar.actionExecutionId}
+                  {...ar}
+                  operationPending={operationPending}
+                  onRetry={() => void runOperation(() => retryAction(runId, ar.actionExecutionId))}
+                  onReconcile={() => void runOperation(() => reconcileAction(runId, ar.actionExecutionId))}
+                />
               ))
             ) : (
               <Empty description="无外部动作记录" />

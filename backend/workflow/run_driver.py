@@ -55,6 +55,10 @@ class RunDriver:
     async def start(self) -> None:
         if self._running:
             return
+        # Repair action/run crash windows before polling executable work.
+        # This scans all Runs (including direct/non-driver and CANCELLED) but
+        # never calls an executor or repeats a side effect.
+        self._repo.recover_action_runtime_invariants()
         self._running = True
         # TestClient and embedded ASGI hosts may start the same process-level
         # singleton on a fresh event loop.  asyncio.Event is loop-bound after
@@ -229,6 +233,13 @@ class RunDriver:
         )
         from backend.planning.continuation import PlanningContinuationCoordinator
 
+        # Durable runtime truth changes before the observational projection:
+        # stale dispatch is UNKNOWN and the Workflow is PAUSED.  It must never
+        # remain RUNNING or be auto-replayed after restart.
+        self._repo.mark_running_action_unknown_and_pause(
+            unknown.get("actionId", ""),
+            reason="runtime restarted after dispatch; external outcome unknown",
+        )
         coord = PlanningContinuationCoordinator(self._repo)
         obs = Observation(
             observationId=generate_observation_id(run.run_id),

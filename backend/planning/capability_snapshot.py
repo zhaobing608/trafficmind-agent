@@ -26,6 +26,9 @@ from backend.planning.param_schema import PLANNER_PARAM_SCHEMAS
 SNAPSHOT_VERSION = 1
 
 # 端到端真实有业务语义的 action（provider 真实产生 semantic effect，非 no-op）
+#   - update_event_status → canonical Event 状态 CAS 更新
+#   - create_dispatch_task → durable 内部处置任务
+#   - send_notification → reliable NotificationProvider（local / webhook）
 #   - notify_wechat / notify_dingtalk → send_wechat_work / send_dingtalk（真实推送）
 #   - save_result → save_event_analysis（真实持久化）
 #   - simulation_traffic_diversion / simulation_signal_adjustment → DemoSimulationProvider
@@ -33,6 +36,9 @@ SNAPSHOT_VERSION = 1
 #   - simulation_monitor / simulation_close / simulation_lane_control /
 #     simulation_dispatch_coordination → DemoSimulationProvider no-op → 不列入
 END_TO_END_IMPLEMENTED_ACTIONS = frozenset({
+    "update_event_status",
+    "create_dispatch_task",
+    "send_notification",
     "notify_wechat",
     "notify_dingtalk",
     "save_result",
@@ -40,10 +46,15 @@ END_TO_END_IMPLEMENTED_ACTIONS = frozenset({
     "simulation_signal_adjustment",
 })
 
-# LLM 可 propose 的 action capability（save_result 是 compiler 结构性插入，不可 propose）
-PROPOSABLE_ACTIONS = frozenset(
-    a for a in END_TO_END_IMPLEMENTED_ACTIONS if a != "save_result"
-)
+# LLM prompt 公开能力仍保持 Phase 18 的小集合；Phase 21.3 reliable
+# actions 先通过 persisted Agent structured recommendation → deterministic
+# planner 接入，不把新的生产副作用能力无审计地扩大到 LLM prompt。
+PROPOSABLE_ACTIONS = frozenset({
+    "notify_wechat",
+    "notify_dingtalk",
+    "simulation_traffic_diversion",
+    "simulation_signal_adjustment",
+})
 
 # capability ID（LLM 看到）→ execution agent type（内部）
 AGENT_CAPABILITY_MAP: Dict[str, str] = {

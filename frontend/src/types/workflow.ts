@@ -6,7 +6,7 @@ export type WorkflowRunStatus =
 
 export type NodeStatus =
   | 'pending' | 'running' | 'succeeded' | 'failed'
-  | 'retrying' | 'skipped' | 'timed_out' | 'awaiting_approval';
+  | 'retrying' | 'skipped' | 'timed_out' | 'awaiting_approval' | 'paused';
 
 export type NodeType =
   | 'trigger' | 'validate_event' | 'rule_router' | 'rag_retrieve'
@@ -126,6 +126,13 @@ export interface WorkflowRuntimeProjection {
   retryCount: number;
   failure: WorkflowRuntimeFailure | null;
   approvalWaiting: WorkflowApprovalWaiting | null;
+  actionWaiting?: {
+    actionExecutionId: string;
+    nodeId: string;
+    actionType: string;
+    status: 'unknown';
+    message: string;
+  } | null;
   cancelledAt: string | null;
   cancelReason: string | null;
   startedAt: string | null;
@@ -181,16 +188,39 @@ export interface WorkflowApproval {
 
 export interface WorkflowActionRecord {
   actionId: string;
-  runId: string;
+  actionExecutionId: string;
+  workflowRunId: string;
   nodeId: string;
+  eventId: string | null;
   actionType: string;
   idempotencyKey: string;
-  params: Record<string, unknown>;
+  semanticActionVersion: string;
+  attempt: number;
   result: Record<string, unknown>;
-  status: 'pending' | 'executing' | 'succeeded' | 'failed';
-  error: string;
-  createdAt: string;
-  completedAt: string;
+  status: 'pending' | 'running' | 'executing' | 'succeeded' | 'failed' | 'unknown' | 'cancelled' | 'blocked';
+  error: string | null;
+  message: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  externalReference: string | null;
+  lastReconciledAt: string | null;
+  reconciliationSupported: boolean;
+  reconciliationMessage: string | null;
+  retryable: boolean;
+  operations: {
+    canRetry: boolean;
+    canReconcile: boolean;
+  };
+  attempts: Array<{
+    attemptId: string;
+    attempt: number;
+    status: WorkflowActionRecord['status'];
+    startedAt: string | null;
+    finishedAt: string | null;
+    externalReference: string | null;
+    error: string | null;
+    lastReconciledAt: string | null;
+  }>;
 }
 
 export interface WorkflowTrace {
@@ -220,7 +250,8 @@ export interface WorkflowTrace {
 export const WORKFLOW_SSE_EVENTS = [
   'workflow_started', 'node_started', 'node_completed', 'node_failed',
   'workflow_paused', 'approval_required', 'workflow_resumed',
-  'action_started', 'action_completed',
+  'action_created', 'action_started', 'action_succeeded', 'action_failed',
+  'action_unknown', 'action_reconciled', 'action_retry_requested', 'action_blocked',
   'workflow_completed', 'workflow_cancelled', 'error', 'done',
 ] as const;
 
@@ -238,7 +269,7 @@ export const NODE_TYPE_LABELS: Record<NodeType, string> = {
 export const NODE_STATUS_COLORS: Record<NodeStatus, string> = {
   pending: '#d9d9d9', running: '#1890ff', succeeded: '#52c41a',
   failed: '#ff4d4f', retrying: '#faad14', skipped: '#d9d9d9',
-  timed_out: '#ff7a45', awaiting_approval: '#722ed1',
+  timed_out: '#ff7a45', awaiting_approval: '#722ed1', paused: '#fa8c16',
 };
 
 /** Run 状态颜色映射 */
@@ -284,6 +315,7 @@ export interface ActionSummary {
   total: number;
   succeeded: number;
   failed: number;
+  unknown?: number;
 }
 
 export interface RunSummary {

@@ -31,6 +31,7 @@ from backend.workflow.models import (
     NodeStatus,
     NodeType,
     WorkflowActionRecord,
+    WorkflowActionAttempt,
     WorkflowApproval,
     WorkflowDefinition,
     WorkflowDefinitionVersion,
@@ -38,6 +39,8 @@ from backend.workflow.models import (
     WorkflowNodeRun,
     WorkflowRun,
     WorkflowRunStatus,
+    compute_action_idempotency_key,
+    compute_legacy_action_idempotency_key,
     generate_event_id,
 )
 from backend.workflow.definition import WorkflowRepository as AbstractWorkflowRepository
@@ -59,6 +62,191 @@ def _get_conn() -> sqlite3.Connection:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _append_event_tx(
+    conn: sqlite3.Connection,
+    run_id: str,
+    event_type: str,
+    *,
+    node_id: str = "",
+    payload: Optional[Dict[str, Any]] = None,
+) -> WorkflowEvent:
+    """Append an immutable audit event inside an existing transaction."""
+    row = conn.execute(
+        "SELECT MAX(sequence) AS seq FROM workflow_events WHERE run_id=?",
+        (run_id,),
+    ).fetchone()
+    sequence = int(row["seq"]) + 1 if row and row["seq"] is not None else 0
+    event = WorkflowEvent(
+        event_id=generate_event_id(run_id, sequence),
+        run_id=run_id,
+        node_id=node_id,
+        event_type=event_type,
+        payload=dict(payload or {}),
+        sequence=sequence,
+    )
+    conn.execute(
+        "INSERT INTO workflow_events VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            event.event_id,
+            event.run_id,
+            event.node_id,
+            event.event_type,
+            json.dumps(event.payload, ensure_ascii=False),
+            event.sequence,
+            event.created_at,
+        ),
+    )
+    return event
+
+
+def _apply_action_finalization_tx(
+    conn: sqlite3.Connection,
+    finalization: Dict[str, Any],
+) -> bool:
+    """Close exactly one claimed action attempt inside a caller transaction."""
+    action_id = str(finalization.get("actionExecutionId") or finalization.get("actionId") or "")
+    attempt = int(finalization.get("attempt") or 0)
+    status = str(finalization.get("status") or "")
+    if not action_id or attempt <= 0 or status not in {
+        ActionStatus.SUCCEEDED.value,
+        ActionStatus.FAILED.value,
+        ActionStatus.UNKNOWN.value,
+        ActionStatus.CANCELLED.value,
+        ActionStatus.BLOCKED.value,
+    }:
+        return False
+    finished_at = str(finalization.get("finishedAt") or _utc_now_iso())
+    result = finalization.get("result") if isinstance(finalization.get("result"), dict) else {}
+    error = str(finalization.get("error") or "")[:500]
+    external_reference = str(finalization.get("externalReference") or "")[:500]
+    reconciliation_supported = 1 if finalization.get("reconciliationSupported") else 0
+    retryable = 1 if finalization.get("retryable") else 0
+    reconciliation_message = str(finalization.get("reconciliationMessage") or "")[:500]
+    update = conn.execute(
+        """UPDATE workflow_action_records SET
+               status=?, result_json=?, error=?, completed_at=?, finished_at=?,
+               external_reference=?, reconciliation_supported=?, retryable=?,
+               reconciliation_message=?
+           WHERE action_id=? AND attempt=? AND status IN ('running','executing')""",
+        (
+            status,
+            json.dumps(result, ensure_ascii=False),
+            error,
+            finished_at,
+            finished_at,
+            external_reference,
+            reconciliation_supported,
+            retryable,
+            reconciliation_message,
+            action_id,
+            attempt,
+        ),
+    )
+    if update.rowcount != 1:
+        return False
+    conn.execute(
+        """UPDATE workflow_action_attempts SET
+               status=?, result_json=?, error=?, finished_at=?, external_reference=?
+           WHERE action_id=? AND attempt=? AND status IN ('running','executing')""",
+        (
+            status,
+            json.dumps(result, ensure_ascii=False),
+            error,
+            finished_at,
+            external_reference,
+            action_id,
+            attempt,
+        ),
+    )
+    return True
+
+
+def _project_unknown_action_to_run_tx(
+    conn: sqlite3.Connection,
+    action_id: str,
+    *,
+    reason: str,
+    project_node: bool = True,
+) -> str:
+    """Project an UNKNOWN action into a safe run state in the same tx.
+
+    Returns the durable run status after projection.  A cancelled run remains
+    cancelled; query-only reconciliation is still possible, but execution is
+    never resumed.  Active runs are paused even when no driver owns them.
+    """
+    action = conn.execute(
+        "SELECT * FROM workflow_action_records WHERE action_id=?",
+        (action_id,),
+    ).fetchone()
+    if action is None or action["status"] != ActionStatus.UNKNOWN.value:
+        return ""
+    run = conn.execute(
+        "SELECT * FROM workflow_runs WHERE run_id=?",
+        (action["run_id"],),
+    ).fetchone()
+    if run is None:
+        return ""
+
+    run_status = str(run["status"] or "")
+    if run_status not in {
+        WorkflowRunStatus.PENDING.value,
+        WorkflowRunStatus.RUNNING.value,
+        WorkflowRunStatus.PAUSED.value,
+        WorkflowRunStatus.CANCELLED.value,
+    }:
+        return run_status
+
+    state = json.loads(run["state_json"] or "{}")
+    action_result = json.loads(action["result_json"] or "{}")
+    state.setdefault("actionResults", {})[action["action_type"]] = {
+        "actionExecutionId": action_id,
+        "status": ActionStatus.UNKNOWN.value,
+        "result": action_result,
+        "error": action["error"] or reason,
+        "externalReference": action["external_reference"] or None,
+    }
+    state["currentNode"] = action["node_id"]
+    if run_status == WorkflowRunStatus.CANCELLED.value:
+        state["status"] = WorkflowRunStatus.CANCELLED.value
+    else:
+        state["status"] = WorkflowRunStatus.PAUSED.value
+        state["finishedAt"] = ""
+
+    if project_node:
+        conn.execute(
+            """UPDATE workflow_node_runs SET status='paused', error=?
+               WHERE node_run_id=(
+                   SELECT node_run_id FROM workflow_node_runs
+                   WHERE run_id=? AND node_id=? AND status='running'
+                   ORDER BY attempt DESC LIMIT 1
+               )""",
+            (reason[:500], action["run_id"], action["node_id"]),
+        )
+    now = _utc_now_iso()
+    if run_status == WorkflowRunStatus.CANCELLED.value:
+        conn.execute(
+            """UPDATE workflow_runs SET state_json=?, updated_at=?
+               WHERE run_id=? AND status='cancelled'""",
+            (json.dumps(state, ensure_ascii=False), now, action["run_id"]),
+        )
+        return WorkflowRunStatus.CANCELLED.value
+
+    conn.execute(
+        """UPDATE workflow_runs SET status='paused', current_node_id=?,
+               state_json=?, updated_at=?, completed_at='',
+               driver_owner=NULL, driver_lease_until=NULL,
+               driver_heartbeat_at=NULL
+           WHERE run_id=? AND status IN ('pending','running','paused')""",
+        (
+            action["node_id"],
+            json.dumps(state, ensure_ascii=False),
+            now,
+            action["run_id"],
+        ),
+    )
+    return WorkflowRunStatus.PAUSED.value
 
 
 def _safe_parse_status(status_str: str) -> WorkflowRunStatus:
@@ -208,7 +396,56 @@ def init_workflow_tables() -> None:
             status TEXT DEFAULT 'pending',
             error TEXT DEFAULT '',
             created_at TEXT DEFAULT '',
-            completed_at TEXT DEFAULT ''
+            completed_at TEXT DEFAULT '',
+            event_id TEXT DEFAULT '',
+            semantic_action_version TEXT DEFAULT 'v1',
+            attempt INTEGER DEFAULT 0,
+            started_at TEXT DEFAULT '',
+            finished_at TEXT DEFAULT '',
+            request_metadata_json TEXT DEFAULT '{}',
+            external_reference TEXT DEFAULT '',
+            last_reconciled_at TEXT DEFAULT '',
+            reconciliation_supported INTEGER DEFAULT 0,
+            retryable INTEGER DEFAULT 0,
+            reconciliation_message TEXT DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS workflow_action_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            action_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            status TEXT DEFAULT 'pending',
+            started_at TEXT DEFAULT '',
+            finished_at TEXT DEFAULT '',
+            request_metadata_json TEXT DEFAULT '{}',
+            external_reference TEXT DEFAULT '',
+            result_json TEXT DEFAULT '{}',
+            error TEXT DEFAULT '',
+            last_reconciled_at TEXT DEFAULT '',
+            UNIQUE(action_id, attempt)
+        );
+
+        CREATE TABLE IF NOT EXISTS workflow_dispatch_tasks (
+            dispatch_task_id TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            workflow_run_id TEXT NOT NULL,
+            action_execution_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            assignee TEXT DEFAULT '',
+            target TEXT DEFAULT '',
+            instruction TEXT DEFAULT '',
+            status TEXT DEFAULT 'created',
+            created_at TEXT DEFAULT '',
+            updated_at TEXT DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS workflow_notification_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            channel TEXT DEFAULT 'local',
+            target TEXT DEFAULT '',
+            message_digest TEXT DEFAULT '',
+            delivered_at TEXT DEFAULT ''
         );
 
         CREATE INDEX IF NOT EXISTS idx_wf_runs_session ON workflow_runs(session_id);
@@ -218,8 +455,44 @@ def init_workflow_tables() -> None:
         CREATE INDEX IF NOT EXISTS idx_wf_approvals_run ON workflow_approvals(run_id);
         CREATE INDEX IF NOT EXISTS idx_wf_actions_run ON workflow_action_records(run_id);
         CREATE INDEX IF NOT EXISTS idx_wf_actions_idem ON workflow_action_records(idempotency_key);
+        CREATE INDEX IF NOT EXISTS idx_wf_action_attempts_action ON workflow_action_attempts(action_id, attempt);
+        CREATE INDEX IF NOT EXISTS idx_wf_dispatch_event ON workflow_dispatch_tasks(event_id);
         CREATE INDEX IF NOT EXISTS idx_wf_versions_def ON workflow_definition_versions(definition_id, version);
     """)
+    # Non-destructive migration for databases created before Phase 21.3.
+    existing_action_columns = {
+        row[1] for row in c.execute("PRAGMA table_info(workflow_action_records)").fetchall()
+    }
+    action_column_defs = {
+        "event_id": "TEXT DEFAULT ''",
+        "semantic_action_version": "TEXT DEFAULT 'v1'",
+        "attempt": "INTEGER DEFAULT 0",
+        "started_at": "TEXT DEFAULT ''",
+        "finished_at": "TEXT DEFAULT ''",
+        "request_metadata_json": "TEXT DEFAULT '{}'",
+        "external_reference": "TEXT DEFAULT ''",
+        "last_reconciled_at": "TEXT DEFAULT ''",
+        "reconciliation_supported": "INTEGER DEFAULT 0",
+        "retryable": "INTEGER DEFAULT 0",
+        "reconciliation_message": "TEXT DEFAULT ''",
+    }
+    for column_name, column_def in action_column_defs.items():
+        if column_name not in existing_action_columns:
+            c.execute(
+                f"ALTER TABLE workflow_action_records ADD COLUMN {column_name} {column_def}"
+            )
+    # Rows written before 21.3 did not carry event_id.  Backfill only from the
+    # same run's persisted canonical event; never infer across runs/events.
+    c.execute(
+        """UPDATE workflow_action_records
+           SET event_id = COALESCE((
+               SELECT json_extract(workflow_runs.state_json, '$.currentEvent.eventId')
+               FROM workflow_runs
+               WHERE workflow_runs.run_id = workflow_action_records.run_id
+                 AND json_valid(workflow_runs.state_json)
+           ), '')
+           WHERE COALESCE(event_id, '') = ''"""
+    )
     conn.commit()
     conn.close()
 
@@ -586,6 +859,7 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
         driver_owner: str = "",
         driver_generation: int = 0,
         checkpoint_run: Optional[WorkflowRun] = None,
+        action_finalization: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Persist a terminal node attempt only while its run may still advance.
 
@@ -638,6 +912,45 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             if cursor.rowcount != 1:
                 conn.rollback()
                 return False
+
+            if action_finalization is not None:
+                action_row = conn.execute(
+                    """SELECT run_id, node_id, action_type, event_id
+                       FROM workflow_action_records WHERE action_id=?""",
+                    (str(action_finalization.get("actionExecutionId") or ""),),
+                ).fetchone()
+                if (
+                    action_row is None
+                    or action_row["run_id"] != node_run.run_id
+                    or action_row["node_id"] != node_run.node_id
+                    or not _apply_action_finalization_tx(conn, action_finalization)
+                ):
+                    conn.rollback()
+                    return False
+                action_status = str(action_finalization.get("status") or "")
+                action_event_type = {
+                    ActionStatus.SUCCEEDED.value: "action_succeeded",
+                    ActionStatus.FAILED.value: "action_failed",
+                    ActionStatus.UNKNOWN.value: "action_unknown",
+                    ActionStatus.CANCELLED.value: "action_blocked",
+                    ActionStatus.BLOCKED.value: "action_blocked",
+                }.get(action_status, "action_blocked")
+                _append_event_tx(
+                    conn,
+                    node_run.run_id,
+                    action_event_type,
+                    node_id=node_run.node_id,
+                    payload={
+                        "actionExecutionId": str(action_finalization.get("actionExecutionId") or ""),
+                        "workflowRunId": node_run.run_id,
+                        "eventId": action_row["event_id"] or None,
+                        "actionType": action_row["action_type"],
+                        "attempt": int(action_finalization.get("attempt") or 0),
+                        "status": action_status,
+                        "externalReference": str(action_finalization.get("externalReference") or "") or None,
+                        "error": str(action_finalization.get("error") or "")[:500] or None,
+                    },
+                )
 
             if checkpoint_run is not None:
                 checkpoint_predicate = "run_id=? AND status != 'cancelled'"
@@ -1153,7 +1466,13 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
         init_workflow_tables()
         conn = _get_conn()
         conn.execute(
-            """INSERT INTO workflow_action_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO workflow_action_records (
+                   action_id, run_id, node_id, action_type, idempotency_key,
+                   params_json, result_json, status, error, created_at, completed_at,
+                   event_id, semantic_action_version, attempt, started_at, finished_at,
+                   request_metadata_json, external_reference, last_reconciled_at,
+                   reconciliation_supported, retryable, reconciliation_message
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(idempotency_key) DO UPDATE SET
                    action_id=excluded.action_id,
                    run_id=excluded.run_id,
@@ -1164,7 +1483,18 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                    status=excluded.status,
                    error=excluded.error,
                    created_at=excluded.created_at,
-                   completed_at=excluded.completed_at
+                   completed_at=excluded.completed_at,
+                   event_id=excluded.event_id,
+                   semantic_action_version=excluded.semantic_action_version,
+                   attempt=excluded.attempt,
+                   started_at=excluded.started_at,
+                   finished_at=excluded.finished_at,
+                   request_metadata_json=excluded.request_metadata_json,
+                   external_reference=excluded.external_reference,
+                   last_reconciled_at=excluded.last_reconciled_at,
+                   reconciliation_supported=excluded.reconciliation_supported,
+                   retryable=excluded.retryable,
+                   reconciliation_message=excluded.reconciliation_message
                WHERE workflow_action_records.action_id=excluded.action_id
                   OR workflow_action_records.status IN ('pending','failed')""",
             (
@@ -1179,10 +1509,33 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                 record.error,
                 record.created_at,
                 record.completed_at,
+                record.event_id,
+                record.semantic_action_version,
+                int(record.attempt or 0),
+                record.started_at,
+                record.finished_at,
+                json.dumps(record.request_metadata, ensure_ascii=False),
+                record.external_reference,
+                record.last_reconciled_at,
+                1 if record.reconciliation_supported else 0,
+                1 if record.retryable else 0,
+                record.reconciliation_message,
             ),
         )
         conn.commit()
         conn.close()
+
+    def get_action_record(self, action_id: str) -> Optional[WorkflowActionRecord]:
+        init_workflow_tables()
+        conn = _get_conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM workflow_action_records WHERE action_id=?",
+                (action_id,),
+            ).fetchone()
+            return self._row_to_action_record(dict(row)) if row is not None else None
+        finally:
+            conn.close()
 
     def get_action_record_by_idempotency_key(
         self, idempotency_key: str
@@ -1208,13 +1561,51 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
         conn.close()
         return [self._row_to_action_record(dict(r)) for r in rows]
 
+    def list_action_attempts(self, action_id: str) -> List[WorkflowActionAttempt]:
+        init_workflow_tables()
+        conn = _get_conn()
+        try:
+            rows = conn.execute(
+                """SELECT * FROM workflow_action_attempts
+                   WHERE action_id=? ORDER BY attempt""",
+                (action_id,),
+            ).fetchall()
+            attempts: List[WorkflowActionAttempt] = []
+            for row in rows:
+                data = dict(row)
+                request_metadata = data.get("request_metadata_json") or "{}"
+                result = data.get("result_json") or "{}"
+                if isinstance(request_metadata, str):
+                    request_metadata = json.loads(request_metadata)
+                if isinstance(result, str):
+                    result = json.loads(result)
+                attempts.append(WorkflowActionAttempt(
+                    attempt_id=data["attempt_id"],
+                    action_id=data["action_id"],
+                    attempt=int(data.get("attempt") or 0),
+                    status=ActionStatus(data.get("status") or "pending"),
+                    started_at=data.get("started_at") or "",
+                    finished_at=data.get("finished_at") or "",
+                    request_metadata=request_metadata or {},
+                    external_reference=data.get("external_reference") or "",
+                    result=result or {},
+                    error=data.get("error") or "",
+                    last_reconciled_at=data.get("last_reconciled_at") or "",
+                ))
+            return attempts
+        finally:
+            conn.close()
+
     def _row_to_action_record(self, d: Dict[str, Any]) -> WorkflowActionRecord:
         params = d.get("params_json", "{}")
         result = d.get("result_json", "{}")
+        request_metadata = d.get("request_metadata_json", "{}")
         if isinstance(params, str):
             params = json.loads(params) if params else {}
         if isinstance(result, str):
             result = json.loads(result) if result else {}
+        if isinstance(request_metadata, str):
+            request_metadata = json.loads(request_metadata) if request_metadata else {}
         return WorkflowActionRecord(
             action_id=d["action_id"],
             run_id=d["run_id"],
@@ -1227,7 +1618,847 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             error=d.get("error", ""),
             created_at=d.get("created_at", ""),
             completed_at=d.get("completed_at", ""),
+            event_id=d.get("event_id", "") or "",
+            semantic_action_version=d.get("semantic_action_version", "v1") or "v1",
+            attempt=int(d.get("attempt", 0) or 0),
+            started_at=d.get("started_at", "") or "",
+            finished_at=d.get("finished_at", "") or "",
+            request_metadata=request_metadata or {},
+            external_reference=d.get("external_reference", "") or "",
+            last_reconciled_at=d.get("last_reconciled_at", "") or "",
+            reconciliation_supported=bool(d.get("reconciliation_supported", 0)),
+            retryable=bool(d.get("retryable", 0)),
+            reconciliation_message=d.get("reconciliation_message", "") or "",
         )
+
+    def claim_action_execution(
+        self,
+        record: WorkflowActionRecord,
+    ) -> Dict[str, Any]:
+        """Claim exactly one side-effect attempt for an idempotency key.
+
+        Initial execution inserts the parent record and attempt atomically.
+        A retry is claimable only after an explicit API transition changed a
+        known FAILED execution back to PENDING.  RUNNING/UNKNOWN/SUCCEEDED are
+        never dispatched again.
+        """
+        init_workflow_tables()
+        conn = _get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            durable_run = conn.execute(
+                "SELECT status FROM workflow_runs WHERE run_id=?",
+                (record.run_id,),
+            ).fetchone()
+            if durable_run is not None and durable_run["status"] == WorkflowRunStatus.CANCELLED.value:
+                conn.rollback()
+                return {"claimed": False, "reason": "run_cancelled", "record": None}
+
+            versioned_key = compute_action_idempotency_key(
+                record.run_id,
+                record.node_id,
+                record.action_type,
+                record.semantic_action_version,
+            )
+            candidate_keys = {record.idempotency_key, versioned_key}
+            if record.semantic_action_version == "v1":
+                candidate_keys.add(compute_legacy_action_idempotency_key(
+                    record.run_id,
+                    record.node_id,
+                    record.action_type,
+                ))
+            placeholders = ",".join("?" for _ in candidate_keys)
+            existing_rows = conn.execute(
+                f"""SELECT * FROM workflow_action_records
+                    WHERE idempotency_key IN ({placeholders})
+                    ORDER BY CASE status
+                        WHEN 'succeeded' THEN 0
+                        WHEN 'unknown' THEN 1
+                        WHEN 'running' THEN 2
+                        WHEN 'executing' THEN 2
+                        WHEN 'pending' THEN 3
+                        ELSE 4
+                    END, created_at ASC""",
+                tuple(candidate_keys),
+            ).fetchall()
+            existing_row = existing_rows[0] if existing_rows else None
+            if len(existing_rows) > 1:
+                existing = self._row_to_action_record(dict(existing_row))
+                conn.rollback()
+                return {
+                    "claimed": False,
+                    "reason": "duplicate_semantic_identity",
+                    "record": existing,
+                }
+            now = _utc_now_iso()
+            if existing_row is None:
+                attempt = 1
+                record.attempt = attempt
+                record.status = ActionStatus.RUNNING
+                record.started_at = now
+                record.created_at = record.created_at or now
+                conn.execute(
+                    """INSERT INTO workflow_action_records (
+                           action_id, run_id, node_id, action_type, idempotency_key,
+                           params_json, result_json, status, error, created_at, completed_at,
+                           event_id, semantic_action_version, attempt, started_at, finished_at,
+                           request_metadata_json, external_reference, last_reconciled_at,
+                           reconciliation_supported, retryable, reconciliation_message
+                       ) VALUES (?, ?, ?, ?, ?, ?, '{}', 'running', '', ?, '', ?, ?, ?, ?, '', ?, '', '', ?, 0, '')""",
+                    (
+                        record.action_id,
+                        record.run_id,
+                        record.node_id,
+                        record.action_type,
+                        record.idempotency_key,
+                        json.dumps(record.params, ensure_ascii=False),
+                        record.created_at,
+                        record.event_id,
+                        record.semantic_action_version,
+                        attempt,
+                        now,
+                        json.dumps(record.request_metadata, ensure_ascii=False),
+                        1 if record.reconciliation_supported else 0,
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO workflow_action_attempts (
+                           attempt_id, action_id, attempt, status, started_at,
+                           request_metadata_json
+                       ) VALUES (?, ?, ?, 'running', ?, ?)""",
+                    (
+                        f"{record.action_id}:attempt:{attempt}",
+                        record.action_id,
+                        attempt,
+                        now,
+                        json.dumps(record.request_metadata, ensure_ascii=False),
+                    ),
+                )
+                _append_event_tx(conn, record.run_id, "action_created", node_id=record.node_id, payload={
+                    "actionExecutionId": record.action_id,
+                    "workflowRunId": record.run_id,
+                    "actionType": record.action_type,
+                    "eventId": record.event_id,
+                    "attempt": attempt,
+                })
+                _append_event_tx(conn, record.run_id, "action_started", node_id=record.node_id, payload={
+                    "actionExecutionId": record.action_id,
+                    "workflowRunId": record.run_id,
+                    "eventId": record.event_id or None,
+                    "actionType": record.action_type,
+                    "attempt": attempt,
+                })
+                conn.commit()
+                claimed = conn.execute(
+                    "SELECT * FROM workflow_action_records WHERE action_id=?",
+                    (record.action_id,),
+                ).fetchone()
+                return {
+                    "claimed": True,
+                    "reason": "created",
+                    "record": self._row_to_action_record(dict(claimed)),
+                }
+
+            existing = self._row_to_action_record(dict(existing_row))
+            if (
+                existing.run_id != record.run_id
+                or existing.node_id != record.node_id
+                or existing.event_id != record.event_id
+                or existing.action_type != record.action_type
+                or existing.semantic_action_version
+                != record.semantic_action_version
+            ):
+                conn.rollback()
+                return {
+                    "claimed": False,
+                    "reason": "identity_mismatch",
+                    "record": existing,
+                }
+            if existing.status != ActionStatus.PENDING:
+                conn.rollback()
+                return {
+                    "claimed": False,
+                    "reason": existing.status.value,
+                    "record": existing,
+                }
+
+            next_attempt = max(0, int(existing.attempt or 0)) + 1
+            claim_request_metadata = dict(record.request_metadata or {})
+            claim_request_metadata["idempotencyKey"] = existing.idempotency_key
+            claimed = conn.execute(
+                """UPDATE workflow_action_records SET
+                       status='running', attempt=?, started_at=?, finished_at='',
+                       completed_at='', result_json='{}', error='', retryable=0,
+                       request_metadata_json=?, external_reference='',
+                       last_reconciled_at='', reconciliation_message=''
+                   WHERE action_id=? AND status='pending'""",
+                (
+                    next_attempt,
+                    now,
+                    json.dumps(claim_request_metadata, ensure_ascii=False),
+                    existing.action_id,
+                ),
+            )
+            if claimed.rowcount != 1:
+                conn.rollback()
+                return {"claimed": False, "reason": "claim_lost", "record": existing}
+            conn.execute(
+                """INSERT INTO workflow_action_attempts (
+                       attempt_id, action_id, attempt, status, started_at,
+                       request_metadata_json
+                   ) VALUES (?, ?, ?, 'running', ?, ?)""",
+                (
+                    f"{existing.action_id}:attempt:{next_attempt}",
+                    existing.action_id,
+                    next_attempt,
+                    now,
+                    json.dumps(claim_request_metadata, ensure_ascii=False),
+                ),
+            )
+            _append_event_tx(conn, existing.run_id, "action_started", node_id=existing.node_id, payload={
+                "actionExecutionId": existing.action_id,
+                "workflowRunId": existing.run_id,
+                "eventId": existing.event_id or None,
+                "actionType": existing.action_type,
+                "attempt": next_attempt,
+            })
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM workflow_action_records WHERE action_id=?",
+                (existing.action_id,),
+            ).fetchone()
+            return {
+                "claimed": True,
+                "reason": "retry",
+                "record": self._row_to_action_record(dict(row)),
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def finalize_action_execution(self, finalization: Dict[str, Any]) -> bool:
+        """Persist one terminal attempt plus its immutable audit event."""
+        init_workflow_tables()
+        _ensure_driver_columns()
+        conn = _get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT run_id, node_id, action_type, event_id FROM workflow_action_records WHERE action_id=?",
+                (str(finalization.get("actionExecutionId") or ""),),
+            ).fetchone()
+            if row is None or not _apply_action_finalization_tx(conn, finalization):
+                conn.rollback()
+                return False
+            status = str(finalization.get("status") or "")
+            event_type = {
+                ActionStatus.SUCCEEDED.value: "action_succeeded",
+                ActionStatus.FAILED.value: "action_failed",
+                ActionStatus.UNKNOWN.value: "action_unknown",
+                ActionStatus.CANCELLED.value: "action_blocked",
+                ActionStatus.BLOCKED.value: "action_blocked",
+            }[status]
+            _append_event_tx(conn, row["run_id"], event_type, node_id=row["node_id"], payload={
+                "actionExecutionId": str(finalization.get("actionExecutionId") or ""),
+                "workflowRunId": row["run_id"],
+                "eventId": row["event_id"] or None,
+                "actionType": row["action_type"],
+                "attempt": int(finalization.get("attempt") or 0),
+                "status": status,
+                "externalReference": str(finalization.get("externalReference") or "") or None,
+                "error": str(finalization.get("error") or "")[:500] or None,
+            })
+            if status == ActionStatus.UNKNOWN.value:
+                _project_unknown_action_to_run_tx(
+                    conn,
+                    str(finalization.get("actionExecutionId") or ""),
+                    reason=(
+                        str(finalization.get("error") or "")
+                        or "external outcome unknown; reconciliation required"
+                    ),
+                    project_node=False,
+                )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def create_dispatch_task(
+        self,
+        *,
+        event_id: str,
+        run_id: str,
+        action_execution_id: str,
+        idempotency_key: str,
+        assignee: str,
+        target: str,
+        instruction: str,
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Create one real internal dispatch task, deduplicated by action key."""
+        init_workflow_tables()
+        conn = _get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM workflow_dispatch_tasks WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                return dict(existing), False
+            task_id = f"dispatch_{action_execution_id}"
+            now = _utc_now_iso()
+            conn.execute(
+                """INSERT INTO workflow_dispatch_tasks (
+                       dispatch_task_id, event_id, workflow_run_id,
+                       action_execution_id, idempotency_key, assignee, target,
+                       instruction, status, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'created', ?, ?)""",
+                (
+                    task_id,
+                    event_id,
+                    run_id,
+                    action_execution_id,
+                    idempotency_key,
+                    assignee,
+                    target,
+                    instruction,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM workflow_dispatch_tasks WHERE dispatch_task_id=?",
+                (task_id,),
+            ).fetchone()
+            return dict(row), True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_dispatch_task_by_idempotency_key(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
+        init_workflow_tables()
+        conn = _get_conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM workflow_dispatch_tasks WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def record_local_notification_receipt(
+        self,
+        *,
+        receipt_id: str,
+        idempotency_key: str,
+        channel: str,
+        target: str,
+        message_digest: str,
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Controlled provider boundary used by development and acceptance tests."""
+        init_workflow_tables()
+        conn = _get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM workflow_notification_receipts WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                return dict(existing), False
+            conn.execute(
+                """INSERT INTO workflow_notification_receipts (
+                       receipt_id, idempotency_key, channel, target,
+                       message_digest, delivered_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    receipt_id,
+                    idempotency_key,
+                    channel,
+                    target,
+                    message_digest,
+                    _utc_now_iso(),
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM workflow_notification_receipts WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+            return dict(row), True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_local_notification_receipt(
+        self,
+        *,
+        external_reference: str = "",
+        idempotency_key: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        init_workflow_tables()
+        conn = _get_conn()
+        try:
+            if external_reference:
+                row = conn.execute(
+                    "SELECT * FROM workflow_notification_receipts WHERE receipt_id=?",
+                    (external_reference,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM workflow_notification_receipts WHERE idempotency_key=?",
+                    (idempotency_key,),
+                ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def request_action_retry(self, action_id: str) -> Dict[str, Any]:
+        """Atomically make a known FAILED action and its run runnable again."""
+        init_workflow_tables()
+        _ensure_driver_columns()
+        conn = _get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            action = conn.execute(
+                "SELECT * FROM workflow_action_records WHERE action_id=?",
+                (action_id,),
+            ).fetchone()
+            if action is None:
+                conn.rollback()
+                return {"updated": False, "reason": "not_found"}
+            run = conn.execute(
+                "SELECT * FROM workflow_runs WHERE run_id=?",
+                (action["run_id"],),
+            ).fetchone()
+            if run is None:
+                conn.rollback()
+                return {"updated": False, "reason": "run_not_found"}
+            if run["status"] == WorkflowRunStatus.CANCELLED.value:
+                conn.rollback()
+                return {"updated": False, "reason": "run_cancelled"}
+            if action["status"] != ActionStatus.FAILED.value or not bool(action["retryable"]):
+                conn.rollback()
+                return {"updated": False, "reason": "invalid_status"}
+            if run["status"] not in {
+                WorkflowRunStatus.FAILED.value,
+                WorkflowRunStatus.PAUSED.value,
+            }:
+                conn.rollback()
+                return {"updated": False, "reason": "invalid_run_status"}
+
+            state = json.loads(run["state_json"] or "{}")
+            state["status"] = WorkflowRunStatus.PENDING.value
+            state["currentNode"] = action["node_id"]
+            state["finishedAt"] = ""
+            state["retryCount"] = int(state.get("retryCount", 0) or 0) + 1
+            update_action = conn.execute(
+                """UPDATE workflow_action_records SET
+                       status='pending', retryable=0, error='', result_json='{}',
+                       started_at='', finished_at='', completed_at='',
+                       external_reference='', last_reconciled_at='',
+                       reconciliation_message=''
+                   WHERE action_id=? AND status='failed' AND retryable=1""",
+                (action_id,),
+            )
+            update_run = conn.execute(
+                """UPDATE workflow_runs SET
+                       status='pending', current_node_id=?, state_json=?,
+                       updated_at=?, completed_at='', driver_managed=1,
+                       driver_owner=NULL, driver_lease_until=NULL,
+                       driver_heartbeat_at=NULL
+                   WHERE run_id=? AND status IN ('failed','paused')""",
+                (
+                    action["node_id"],
+                    json.dumps(state, ensure_ascii=False),
+                    _utc_now_iso(),
+                    action["run_id"],
+                ),
+            )
+            if update_action.rowcount != 1 or update_run.rowcount != 1:
+                conn.rollback()
+                return {"updated": False, "reason": "concurrent_change"}
+            _append_event_tx(conn, action["run_id"], "action_retry_requested", node_id=action["node_id"], payload={
+                "actionExecutionId": action_id,
+                "workflowRunId": action["run_id"],
+                "eventId": action["event_id"] or None,
+                "actionType": action["action_type"],
+                "previousAttempt": int(action["attempt"] or 0),
+                "attempt": int(action["attempt"] or 0) + 1,
+            })
+            conn.commit()
+            return {
+                "updated": True,
+                "runId": action["run_id"],
+                "nodeId": action["node_id"],
+                "actionExecutionId": action_id,
+                "nextAttempt": int(action["attempt"] or 0) + 1,
+                "retryCount": int(state.get("retryCount", 0) or 0),
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def apply_action_reconciliation(
+        self,
+        action_id: str,
+        *,
+        status: ActionStatus,
+        result: Optional[Dict[str, Any]] = None,
+        error: str = "",
+        external_reference: str = "",
+        supported: bool = True,
+        retryable: bool = False,
+        message: str = "",
+    ) -> Dict[str, Any]:
+        """Apply a query-only reconciliation result without re-executing."""
+        if status not in {ActionStatus.SUCCEEDED, ActionStatus.FAILED, ActionStatus.UNKNOWN}:
+            raise ValueError(f"invalid reconciliation status: {status.value}")
+        init_workflow_tables()
+        _ensure_driver_columns()
+        conn = _get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            action = conn.execute(
+                "SELECT * FROM workflow_action_records WHERE action_id=?",
+                (action_id,),
+            ).fetchone()
+            if action is None:
+                conn.rollback()
+                return {"updated": False, "reason": "not_found"}
+            if action["status"] != ActionStatus.UNKNOWN.value:
+                conn.rollback()
+                return {"updated": False, "reason": "invalid_status"}
+            run = conn.execute(
+                "SELECT * FROM workflow_runs WHERE run_id=?",
+                (action["run_id"],),
+            ).fetchone()
+            if run is None:
+                conn.rollback()
+                return {"updated": False, "reason": "run_not_found"}
+            if run["status"] not in {
+                WorkflowRunStatus.PAUSED.value,
+                WorkflowRunStatus.RUNNING.value,
+                WorkflowRunStatus.FAILED.value,
+                WorkflowRunStatus.CANCELLED.value,
+            }:
+                conn.rollback()
+                return {"updated": False, "reason": "invalid_run_status"}
+
+            now = _utc_now_iso()
+            safe_result = result if isinstance(result, dict) else {}
+            run_cancelled = run["status"] == WorkflowRunStatus.CANCELLED.value
+            next_retryable = (
+                1
+                if status == ActionStatus.FAILED and retryable and not run_cancelled
+                else 0
+            )
+            finished_at = now if status != ActionStatus.UNKNOWN else ""
+            action_update = conn.execute(
+                """UPDATE workflow_action_records SET
+                       status=?, result_json=?, error=?, external_reference=?,
+                       last_reconciled_at=?, reconciliation_supported=?,
+                       retryable=?, reconciliation_message=?,
+                       finished_at=CASE WHEN ?='' THEN finished_at ELSE ? END,
+                       completed_at=CASE WHEN ?='' THEN completed_at ELSE ? END
+                   WHERE action_id=? AND status='unknown'""",
+                (
+                    status.value,
+                    json.dumps(safe_result, ensure_ascii=False),
+                    str(error or "")[:500],
+                    external_reference or action["external_reference"],
+                    now,
+                    1 if supported else 0,
+                    next_retryable,
+                    str(message or "")[:500],
+                    finished_at,
+                    finished_at,
+                    finished_at,
+                    finished_at,
+                    action_id,
+                ),
+            )
+            if action_update.rowcount != 1:
+                conn.rollback()
+                return {"updated": False, "reason": "concurrent_change"}
+            conn.execute(
+                """UPDATE workflow_action_attempts SET
+                       status=?, result_json=?, error=?, external_reference=?,
+                       last_reconciled_at=?,
+                       finished_at=CASE WHEN ?='' THEN finished_at ELSE ? END
+                   WHERE action_id=? AND attempt=?""",
+                (
+                    status.value,
+                    json.dumps(safe_result, ensure_ascii=False),
+                    str(error or "")[:500],
+                    external_reference or action["external_reference"],
+                    now,
+                    finished_at,
+                    finished_at,
+                    action_id,
+                    int(action["attempt"] or 0),
+                ),
+            )
+            state = json.loads(run["state_json"] or "{}")
+            resolved_external_reference = (
+                external_reference or action["external_reference"]
+            )
+            action_output = {
+                "action_id": action_id,
+                "actionExecutionId": action_id,
+                "action_type": action["action_type"],
+                "actionType": action["action_type"],
+                "attempt": int(action["attempt"] or 0),
+                "status": status.value,
+                "result": safe_result,
+                "error": str(error or "")[:500],
+                "externalReference": resolved_external_reference or None,
+                "reconciliationSupported": bool(supported),
+                "retryable": bool(next_retryable),
+            }
+            state.setdefault("actionResults", {})[action["action_type"]] = {
+                "actionExecutionId": action_id,
+                "status": status.value,
+                "result": safe_result,
+                "error": str(error or "")[:500],
+                "externalReference": resolved_external_reference or None,
+            }
+            if run_cancelled:
+                # Reconciliation is query-only.  It may improve the durable
+                # Action fact, but must never revive or advance a cancelled
+                # Workflow, even when the provider confirms success.
+                state["status"] = WorkflowRunStatus.CANCELLED.value
+                run_update = conn.execute(
+                    """UPDATE workflow_runs SET state_json=?, updated_at=?
+                       WHERE run_id=? AND status='cancelled'""",
+                    (
+                        json.dumps(state, ensure_ascii=False),
+                        now,
+                        action["run_id"],
+                    ),
+                )
+                if run_update.rowcount != 1:
+                    conn.rollback()
+                    return {"updated": False, "reason": "concurrent_change"}
+                if status in {ActionStatus.SUCCEEDED, ActionStatus.FAILED}:
+                    _append_event_tx(
+                        conn,
+                        action["run_id"],
+                        (
+                            "action_succeeded"
+                            if status == ActionStatus.SUCCEEDED
+                            else "action_failed"
+                        ),
+                        node_id=action["node_id"],
+                        payload={
+                            "actionExecutionId": action_id,
+                            "workflowRunId": action["run_id"],
+                            "eventId": action["event_id"] or None,
+                            "actionType": action["action_type"],
+                            "attempt": int(action["attempt"] or 0),
+                            "source": "reconciliation",
+                            "runCancelled": True,
+                            "retryable": False,
+                        },
+                    )
+            elif status == ActionStatus.SUCCEEDED:
+                completed = state.get("completedSteps") or []
+                if action["node_id"] not in completed:
+                    completed.append(action["node_id"])
+                state["completedSteps"] = completed
+                state["currentNode"] = action["node_id"]
+                state["status"] = WorkflowRunStatus.PENDING.value
+                state["finishedAt"] = ""
+                state.setdefault("nodeOutputs", {})[action["node_id"]] = action_output
+                conn.execute(
+                    """UPDATE workflow_node_runs SET status='succeeded', error='',
+                           completed_at=?, output_snapshot_json=?
+                       WHERE node_run_id=(
+                           SELECT node_run_id FROM workflow_node_runs
+                           WHERE run_id=? AND node_id=? AND status IN ('running','paused')
+                           ORDER BY attempt DESC LIMIT 1
+                       )""",
+                    (
+                        now,
+                        json.dumps(action_output, ensure_ascii=False),
+                        action["run_id"],
+                        action["node_id"],
+                    ),
+                )
+                run_update = conn.execute(
+                    """UPDATE workflow_runs SET
+                           status='pending', current_node_id=?, state_json=?,
+                           updated_at=?, completed_at='', driver_managed=1,
+                           driver_owner=NULL, driver_lease_until=NULL,
+                           driver_heartbeat_at=NULL
+                       WHERE run_id=? AND status IN ('paused','running','failed')""",
+                    (
+                        action["node_id"],
+                        json.dumps(state, ensure_ascii=False),
+                        now,
+                        action["run_id"],
+                    ),
+                )
+                if run_update.rowcount != 1:
+                    conn.rollback()
+                    return {"updated": False, "reason": "concurrent_change"}
+                _append_event_tx(conn, action["run_id"], "action_succeeded", node_id=action["node_id"], payload={
+                    "actionExecutionId": action_id,
+                    "workflowRunId": action["run_id"],
+                    "eventId": action["event_id"] or None,
+                    "actionType": action["action_type"],
+                    "attempt": int(action["attempt"] or 0),
+                    "source": "reconciliation",
+                })
+            elif status == ActionStatus.FAILED:
+                state["status"] = WorkflowRunStatus.FAILED.value
+                state["finishedAt"] = now
+                state.setdefault("errors", []).append({
+                    "nodeId": action["node_id"],
+                    "error": str(error or message or "reconciliation confirmed not executed")[:500],
+                    "attempt": int(action["attempt"] or 0),
+                    "timestamp": now,
+                })
+                conn.execute(
+                    """UPDATE workflow_node_runs SET status='failed', error=?, completed_at=?
+                       WHERE node_run_id=(
+                           SELECT node_run_id FROM workflow_node_runs
+                           WHERE run_id=? AND node_id=? AND status IN ('running','paused')
+                           ORDER BY attempt DESC LIMIT 1
+                       )""",
+                    (str(error or message or "not executed")[:500], now, action["run_id"], action["node_id"]),
+                )
+                run_update = conn.execute(
+                    """UPDATE workflow_runs SET status='failed', state_json=?, updated_at=?, completed_at=?
+                       WHERE run_id=? AND status IN ('paused','running','failed')""",
+                    (json.dumps(state, ensure_ascii=False), now, now, action["run_id"]),
+                )
+                if run_update.rowcount != 1:
+                    conn.rollback()
+                    return {"updated": False, "reason": "concurrent_change"}
+                _append_event_tx(conn, action["run_id"], "action_failed", node_id=action["node_id"], payload={
+                    "actionExecutionId": action_id,
+                    "workflowRunId": action["run_id"],
+                    "eventId": action["event_id"] or None,
+                    "actionType": action["action_type"],
+                    "attempt": int(action["attempt"] or 0),
+                    "source": "reconciliation",
+                    "retryable": bool(retryable),
+                })
+            elif status == ActionStatus.UNKNOWN:
+                _project_unknown_action_to_run_tx(
+                    conn,
+                    action_id,
+                    reason=(
+                        str(error or message or "external outcome remains unknown")[:500]
+                    ),
+                )
+            _append_event_tx(conn, action["run_id"], "action_reconciled", node_id=action["node_id"], payload={
+                "actionExecutionId": action_id,
+                "workflowRunId": action["run_id"],
+                "eventId": action["event_id"] or None,
+                "actionType": action["action_type"],
+                "attempt": int(action["attempt"] or 0),
+                "outcome": status.value,
+                "supported": bool(supported),
+                "message": str(message or "")[:500] or None,
+            })
+            conn.commit()
+            return {
+                "updated": True,
+                "runId": action["run_id"],
+                "nodeId": action["node_id"],
+                "actionExecutionId": action_id,
+                "status": status.value,
+                "runStatus": run["status"] if run_cancelled else (
+                    WorkflowRunStatus.PENDING.value
+                    if status == ActionStatus.SUCCEEDED
+                    else (
+                        WorkflowRunStatus.FAILED.value
+                        if status == ActionStatus.FAILED
+                        else run["status"]
+                    )
+                ),
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def mark_running_action_unknown_and_pause(
+        self,
+        action_id: str,
+        *,
+        reason: str = "runtime restarted after dispatch; outcome unknown",
+    ) -> bool:
+        """Crash recovery fence: RUNNING action becomes UNKNOWN, never replayed."""
+        init_workflow_tables()
+        _ensure_driver_columns()
+        conn = _get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            action = conn.execute(
+                "SELECT * FROM workflow_action_records WHERE action_id=?",
+                (action_id,),
+            ).fetchone()
+            if action is None or action["status"] not in {"running", "executing"}:
+                conn.rollback()
+                return False
+            run = conn.execute(
+                "SELECT * FROM workflow_runs WHERE run_id=?",
+                (action["run_id"],),
+            ).fetchone()
+            if run is None:
+                conn.rollback()
+                return False
+            conn.execute(
+                """UPDATE workflow_action_records SET
+                       status='unknown', error=?, reconciliation_message=?
+                   WHERE action_id=? AND status IN ('running','executing')""",
+                (reason[:500], "reconciliation required before retry", action_id),
+            )
+            conn.execute(
+                """UPDATE workflow_action_attempts SET status='unknown', error=?
+                   WHERE action_id=? AND attempt=? AND status IN ('running','executing')""",
+                (reason[:500], action_id, int(action["attempt"] or 0)),
+            )
+            _project_unknown_action_to_run_tx(
+                conn,
+                action_id,
+                reason=reason,
+            )
+            _append_event_tx(conn, action["run_id"], "action_unknown", node_id=action["node_id"], payload={
+                "actionExecutionId": action_id,
+                "workflowRunId": action["run_id"],
+                "eventId": action["event_id"] or None,
+                "actionType": action["action_type"],
+                "attempt": int(action["attempt"] or 0),
+                "reason": reason,
+                "recovery": True,
+            })
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     # ── Batch Read Helpers (Workflow Center V2 Round 1) ──────────────────
 
@@ -1236,7 +2467,7 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
     ) -> Dict[str, Dict[str, int]]:
         """批量获取每个 Run 的节点执行统计。
 
-        返回: {run_id: {"total": N, "succeeded": N, "failed": N}}
+        返回: {run_id: {"total": N, "succeeded": N, "failed": N, "unknown": N}}
         不存在的 run_id 不出现在结果中。
         """
         if not run_ids:
@@ -1300,12 +2531,14 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             st = row["status"]
             cnt = row["cnt"]
             if rid not in result:
-                result[rid] = {"total": 0, "succeeded": 0, "failed": 0}
+                result[rid] = {"total": 0, "succeeded": 0, "failed": 0, "unknown": 0}
             result[rid]["total"] += cnt
             if st in ("succeeded",):
                 result[rid]["succeeded"] += cnt
             elif st in ("failed",):
                 result[rid]["failed"] += cnt
+            elif st == "unknown":
+                result[rid]["unknown"] += cnt
         return result
 
     def batch_get_definition_summaries(
@@ -1972,8 +3205,109 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             conn.close()
 
     def list_executing_action_records(self, run_id: str) -> List["WorkflowActionRecord"]:
-        """列出 run 中 status=EXECUTING 的 action record（dispatch started 但未完成）。"""
-        return [a for a in self.list_action_records(run_id) if a.status == ActionStatus.EXECUTING]
+        """列出 dispatch marker 已写但尚无 terminal result 的 Action。"""
+        return [
+            action for action in self.list_action_records(run_id)
+            if action.status in {ActionStatus.RUNNING, ActionStatus.EXECUTING}
+        ]
+
+    def recover_action_runtime_invariants(self) -> Dict[str, int]:
+        """Repair crash windows without dispatching any side effect.
+
+        * RUNNING/EXECUTING under a cancelled Run becomes UNKNOWN while the
+          Run remains terminal.
+        * An already UNKNOWN Action under an active Run projects the node/Run
+          to PAUSED, including legacy non-driver-managed Runs.
+        """
+        init_workflow_tables()
+        _ensure_driver_columns()
+        conn = _get_conn()
+        cancelled_markers = 0
+        active_projections = 0
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            stranded = conn.execute(
+                """SELECT a.* FROM workflow_action_records a
+                   JOIN workflow_runs r ON r.run_id=a.run_id
+                   WHERE r.status='cancelled'
+                     AND a.status IN ('running','executing')"""
+            ).fetchall()
+            for action in stranded:
+                reason = "run cancelled after dispatch; external outcome unknown"
+                changed = conn.execute(
+                    """UPDATE workflow_action_records SET
+                           status='unknown', error=?, retryable=0,
+                           reconciliation_message='reconciliation required before retry'
+                       WHERE action_id=? AND status IN ('running','executing')""",
+                    (reason, action["action_id"]),
+                )
+                if changed.rowcount != 1:
+                    continue
+                conn.execute(
+                    """UPDATE workflow_action_attempts SET status='unknown', error=?
+                       WHERE action_id=? AND attempt=?
+                         AND status IN ('running','executing')""",
+                    (reason, action["action_id"], int(action["attempt"] or 0)),
+                )
+                _project_unknown_action_to_run_tx(
+                    conn,
+                    action["action_id"],
+                    reason=reason,
+                )
+                _append_event_tx(
+                    conn,
+                    action["run_id"],
+                    "action_unknown",
+                    node_id=action["node_id"],
+                    payload={
+                        "actionExecutionId": action["action_id"],
+                        "workflowRunId": action["run_id"],
+                        "eventId": action["event_id"] or None,
+                        "actionType": action["action_type"],
+                        "attempt": int(action["attempt"] or 0),
+                        "reason": reason,
+                        "recovery": True,
+                        "runCancelled": True,
+                    },
+                )
+                cancelled_markers += 1
+
+            unprojected = conn.execute(
+                """SELECT a.* FROM workflow_action_records a
+                   JOIN workflow_runs r ON r.run_id=a.run_id
+                   WHERE a.status='unknown'
+                     AND r.status IN ('pending','running')"""
+            ).fetchall()
+            for action in unprojected:
+                reason = action["error"] or "external outcome unknown; reconciliation required"
+                projected = _project_unknown_action_to_run_tx(
+                    conn,
+                    action["action_id"],
+                    reason=reason,
+                )
+                if projected == WorkflowRunStatus.PAUSED.value:
+                    _append_event_tx(
+                        conn,
+                        action["run_id"],
+                        "workflow_paused",
+                        node_id=action["node_id"],
+                        payload={
+                            "actionExecutionId": action["action_id"],
+                            "reason": "UNKNOWN Action recovered after restart",
+                            "recovery": True,
+                        },
+                    )
+                    active_projections += 1
+            conn.commit()
+            return {
+                "cancelledMarkers": cancelled_markers,
+                "activeProjections": active_projections,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     # ── Phase17 P1: plan discovery ────────────────────────────────────────
 

@@ -20,6 +20,7 @@ from backend.workflow.models import (
     generate_approval_id,
 )
 from backend.workflow.state import TrafficWorkflowState, WorkflowRunStatus
+from backend.workflow.action_execution import contains_sensitive_key
 
 
 async def execute_human_approval(
@@ -122,6 +123,17 @@ async def execute_human_approval(
                 entry["actionStepId"] = target_action_step_id
             proposed_actions.append(entry)
 
+    if contains_sensitive_key(proposed_actions):
+        reason = "审批候选包含禁止持久化的 credential/secret 字段"
+        state.add_audit_event("approval_blocked", config.node_id, {
+            "reason": reason,
+        })
+        return {
+            "approval_required": False,
+            "status": "blocked",
+            "error": reason,
+        }
+
     # 从 rule_router 结果中获取审批原因
     risk = state.risk_assessment or {}
     event = state.current_event or {}
@@ -187,6 +199,20 @@ def process_approval_decision(
     pending = state.pending_approval
     if not pending:
         return {"error": "没有待处理的审批"}
+
+    candidate_actions = (
+        (edited_actions or [])
+        if decision == ApprovalDecision.EDITED
+        else pending.get("proposedActions", [])
+    )
+    if (
+        decision in {ApprovalDecision.APPROVED, ApprovalDecision.EDITED}
+        and contains_sensitive_key(candidate_actions)
+    ):
+        return {
+            "error": "审批内容包含禁止持久化的 credential/secret 字段",
+            "errorCode": "invalid_parameters",
+        }
 
     approval_id = pending.get("approvalId", "")
 

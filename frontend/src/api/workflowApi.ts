@@ -4,6 +4,7 @@ import type {
   RunListResponse,
   DecisionProvenanceEntry,
   WorkflowApproval,
+  WorkflowActionRecord,
   WorkflowRunStatus,
   WorkflowRuntimeOperations,
   WorkflowRuntimeProjection,
@@ -25,7 +26,7 @@ export interface WorkflowRunDetail {
   state: Record<string, unknown>;
   nodeRuns: Array<Record<string, unknown>>;
   events: Array<Record<string, unknown>>;
-  actionRecords: Array<Record<string, unknown>>;
+  actionRecords: WorkflowActionRecord[];
   nodeCount: number; eventCount: number;
   decisionProvenance?: DecisionProvenanceEntry[];
   runtime: WorkflowRuntimeProjection;
@@ -38,7 +39,7 @@ export interface WorkflowTrace {
   status: string; currentNodeId: string;
   timeline: Array<Record<string, unknown>>;
   nodeRuns: Array<Record<string, unknown>>;
-  actionRecords: Array<Record<string, unknown>>;
+  actionRecords: WorkflowActionRecord[];
   approvals?: WorkflowApproval[];
 }
 
@@ -150,6 +151,32 @@ export async function retryNode(runId: string, nodeId: string): Promise<Record<s
     body: JSON.stringify({ nodeId }),
   });
   if (!resp.ok) throw await responseError(resp, `Failed to retry: ${resp.status}`);
+  return resp.json();
+}
+
+/** Retry is allowed only after the provider/executor confirmed no side effect. */
+export async function retryAction(
+  runId: string,
+  actionExecutionId: string,
+): Promise<Record<string, unknown>> {
+  const resp = await fetch(
+    `${API}/workflow/runs/${encodeURIComponent(runId)}/actions/${encodeURIComponent(actionExecutionId)}/retry`,
+    { method: 'POST' },
+  );
+  if (!resp.ok) throw await responseError(resp, `Failed to retry action: ${resp.status}`);
+  return resp.json();
+}
+
+/** Query external truth for UNKNOWN; this endpoint never repeats execute. */
+export async function reconcileAction(
+  runId: string,
+  actionExecutionId: string,
+): Promise<Record<string, unknown>> {
+  const resp = await fetch(
+    `${API}/workflow/runs/${encodeURIComponent(runId)}/actions/${encodeURIComponent(actionExecutionId)}/reconcile`,
+    { method: 'POST' },
+  );
+  if (!resp.ok) throw await responseError(resp, `Failed to reconcile action: ${resp.status}`);
   return resp.json();
 }
 

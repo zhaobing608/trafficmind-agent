@@ -86,6 +86,7 @@ export const WorkflowWorkspace: React.FC<Props> = ({ workflowRunId, sessionId, o
   selectionRef.current = workflowRunId;
   const abortRef = useRef<AbortController | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const runtimeFingerprintRef = useRef('');
 
   // ── Polling ──
   const startPolling = useCallback((runId: string) => {
@@ -95,10 +96,20 @@ export const WorkflowWorkspace: React.FC<Props> = ({ workflowRunId, sessionId, o
         const detail = await getRun(runId);
         if (selectionRef.current !== runId) return;
         const serverStatus = (detail.run as Record<string, unknown>).status as string;
-        setRunStatus(prev => {
-          if (serverStatus !== prev) setTraceRefreshKey(k => k + 1);
-          return serverStatus;
+        const fingerprint = JSON.stringify({
+          updatedAt: detail.run.updatedAt || '',
+          actions: (detail.actionRecords || []).map(action => [
+            action.actionExecutionId,
+            action.status,
+            action.attempt,
+            action.lastReconciledAt,
+          ]),
         });
+        if (fingerprint !== runtimeFingerprintRef.current) {
+          runtimeFingerprintRef.current = fingerprint;
+          setTraceRefreshKey(k => k + 1);
+        }
+        setRunStatus(serverStatus);
         setError(null);
         if (!POLLABLE.has(serverStatus)) stopPolling();
       } catch { /* retry on next interval */ }
@@ -124,6 +135,7 @@ export const WorkflowWorkspace: React.FC<Props> = ({ workflowRunId, sessionId, o
   // Sync pageState when workflowRunId changes
   useEffect(() => {
     if (workflowRunId) {
+      runtimeFingerprintRef.current = '';
       setPageState('running');
       connectLiveStream(workflowRunId);
     } else {
