@@ -27,6 +27,7 @@ import type { EventRelations, Relation } from './eventWorkbenchState';
 import { isCurrentEventRecord } from './eventReality';
 import './eventWorkbench.css';
 import { PilotMapPanel } from '../map/PilotMapPanel';
+import { EventTraceTimeline } from '../operations/EventTraceTimeline';
 
 const LIMIT = 50;
 
@@ -616,6 +617,11 @@ export const RealEventsPanel: React.FC<Props> = ({ focusEventId, focusRoadName, 
                   {latestRun && onOpenRun && <button className="event-text-button" onClick={() => onOpenRun(latestRun.runId)}>查看执行</button>}
                 </div>
               </section>
+              <EventTraceTimeline
+                eventId={selectedEvent.eventId}
+                onOpenWorkflow={onOpenRun}
+                onOpenPlan={onOpenPlan}
+              />
               {relations.workflow.status === 'SUCCESS_WITH_DATA' && onOpenRun && (
                 <details key={selectedEvent.eventId} className="event-technical" onToggle={e => setExpandedRunsFor(e.currentTarget.open ? selectedEvent.eventId : null)}>
                   <summary>全部相关执行（{relations.workflow.total}）</summary>

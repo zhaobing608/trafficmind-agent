@@ -12,7 +12,7 @@
 
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from backend.config import DB_PATH
 from backend.tools.event_tools import safe_float
@@ -25,6 +25,10 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row  # 让查询结果支持按列名访问
     return conn
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # 第二阶段新增字段迁移列表
@@ -81,6 +85,29 @@ def init_db() -> None:
             updatedAt TEXT NOT NULL
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS event_ingestion_audit (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL,
+            source TEXT DEFAULT '',
+            source_event_id TEXT DEFAULT '',
+            outcome TEXT NOT NULL,
+            revision INTEGER DEFAULT 1,
+            occurred_at TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS event_lifecycle_audit (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            previous_status TEXT DEFAULT '',
+            status TEXT DEFAULT '',
+            actor TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
     _migrate_schema(cursor)
     # Empty sourceEventId values are legacy rows and deliberately excluded.
     # Real ingested events are uniquely identified by their upstream source.
@@ -88,6 +115,18 @@ def init_db() -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS idx_event_records_source_identity
         ON event_records(source, sourceEventId)
         WHERE sourceEventId IS NOT NULL AND sourceEventId <> ''
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_event_ingestion_event_sequence
+        ON event_ingestion_audit(event_id, sequence)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_event_ingestion_outcome_created
+        ON event_ingestion_audit(outcome, created_at)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_event_lifecycle_event_sequence
+        ON event_lifecycle_audit(event_id, sequence)
     """)
     conn.commit()
     conn.close()
@@ -103,14 +142,24 @@ def save_event_analysis(result: Dict[str, Any]) -> bool:
     Returns:
         是否保存成功
     """
+    conn: Optional[sqlite3.Connection] = None
     try:
         init_db()  # 确保表存在 + 迁移
         conn = get_connection()
         cursor = conn.cursor()
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = _utc_now_iso()
 
         standard_event = result.get("standardEvent", {})
         event_id = result.get("eventId", standard_event.get("eventId", ""))
+        next_status = result.get("status", "待派单")
+
+        # Read and write under one lock so a legacy analysis upsert cannot
+        # change Event status without the matching durable lifecycle fact.
+        cursor.execute("BEGIN IMMEDIATE")
+        previous = cursor.execute(
+            "SELECT status, sourceEventId FROM event_records WHERE eventId=?",
+            (event_id,),
+        ).fetchone()
 
         cursor.execute("""
             INSERT INTO event_records
@@ -165,19 +214,41 @@ def save_event_analysis(result: Dict[str, Any]) -> bool:
             1 if standard_event.get("nearbyHospital") else 0,
             result.get("riskScore", 0),
             result.get("riskLevel", ""),
-            result.get("status", "待派单"),
+            next_status,
             result.get("report", ""),
             json.dumps(standard_event, ensure_ascii=False),
             json.dumps(result, ensure_ascii=False),
             result.get("analyzedAt", now),
             now,
         ))
+        if (
+            previous is not None
+            and not str(previous["sourceEventId"] or "").strip()
+            and str(previous["status"] or "") != str(next_status or "")
+        ):
+            cursor.execute(
+                """INSERT INTO event_lifecycle_audit (
+                       event_id, event_type, previous_status, status, actor,
+                       created_at
+                   ) VALUES (?, 'event_status_updated', ?, ?,
+                             'analysis_upsert', ?)""",
+                (
+                    event_id,
+                    str(previous["status"] or ""),
+                    str(next_status or ""),
+                    now,
+                ),
+            )
         conn.commit()
-        conn.close()
         return True
     except Exception as e:
+        if conn is not None:
+            conn.rollback()
         print(f"[DB] 保存失败: {e}")
         return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def get_history(limit: int = 50) -> List[Dict[str, Any]]:
@@ -271,17 +342,31 @@ def update_event_status(event_id: str, status: str) -> bool:
 
     init_db()
     conn = get_connection()
-    cursor = conn.cursor()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    cursor.execute(
-        "UPDATE event_records SET status = ?, updatedAt = ? WHERE eventId = ?",
-        (status, now, event_id),
-    )
-    affected = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return affected > 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT status FROM event_records WHERE eventId=?",
+            (event_id,),
+        ).fetchone()
+        if existing is None:
+            conn.rollback()
+            return False
+        now = _utc_now_iso()
+        cursor = conn.execute(
+            "UPDATE event_records SET status = ?, updatedAt = ? WHERE eventId = ?",
+            (status, now, event_id),
+        )
+        if cursor.rowcount == 1 and str(existing["status"] or "") != status:
+            conn.execute(
+                """INSERT INTO event_lifecycle_audit (
+                       event_id, event_type, previous_status, status, actor, created_at
+                   ) VALUES (?, 'event_status_updated', ?, ?, 'status_api', ?)""",
+                (event_id, str(existing["status"] or ""), status, now),
+            )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
 
 
 def advance_event_status(
@@ -303,18 +388,30 @@ def advance_event_status(
     init_db()
     conn = get_connection()
     try:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if allowed_from:
-            placeholders = ",".join("?" for _ in allowed_from)
-            cursor = conn.execute(
-                f"UPDATE event_records SET status=?, updatedAt=? "
-                f"WHERE eventId=? AND status IN ({placeholders})",
-                (status, now, event_id, *allowed_from),
-            )
-        else:
-            cursor = conn.execute(
-                "UPDATE event_records SET status=?, updatedAt=? WHERE eventId=?",
-                (status, now, event_id),
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT status FROM event_records WHERE eventId=?",
+            (event_id,),
+        ).fetchone()
+        if existing is None:
+            conn.rollback()
+            return False
+        previous = str(existing["status"] or "")
+        if allowed_from and previous not in allowed_from:
+            conn.rollback()
+            return False
+        now = _utc_now_iso()
+        cursor = conn.execute(
+            """UPDATE event_records SET status=?, updatedAt=?
+               WHERE eventId=? AND status=?""",
+            (status, now, event_id, previous),
+        )
+        if cursor.rowcount == 1 and previous != status:
+            conn.execute(
+                """INSERT INTO event_lifecycle_audit (
+                       event_id, event_type, previous_status, status, actor, created_at
+                   ) VALUES (?, 'event_status_updated', ?, ?, 'runtime', ?)""",
+                (event_id, previous, status, now),
             )
         conn.commit()
         return cursor.rowcount == 1

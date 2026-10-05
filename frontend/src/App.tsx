@@ -14,6 +14,7 @@ import { SessionManagement } from './components/collaboration/SessionManagement'
 import { ReportDashboard } from './components/report/ReportDashboard';
 import { AlertDashboard } from './components/alert/AlertDashboard';
 import { GuidePage } from './components/guide/GuidePage';
+import { OperationsWorkspace } from './components/operations/OperationsWorkspace';
 import { visualTokens } from './styles/visualTokens';
 import { collabApi } from './api/collaborationApi';
 import { groupRecentJudgments } from './utils/judgment';
@@ -27,6 +28,7 @@ const WORKSPACE_INFO: Record<string, { title: string; sub: string; showFullModes
   workflow: { title: '工作流中心', sub: '查看运行记录、跟踪执行状态或从模板启动新的工作流', showFullModes: false, defaultMode: 'routed' },
   simulation: { title: '交通态势', sub: '实时事件、路网风险与处置进展', showFullModes: false, defaultMode: 'routed' },
   planning: { title: '处置方案中心', sub: '方案内容 · 执行记录 · 调整历史 · 审计信息', showFullModes: false, defaultMode: 'routed' },
+  operations: { title: '运行监控', sub: '生产运行事实 · 待确认执行 · 持久化告警', showFullModes: false, defaultMode: 'routed' },
 };
 
 export default function App() {
@@ -48,7 +50,7 @@ export default function App() {
   const initialWorkflowRunId = urlWorkflowRunId || null;
   const initialSimulationRunId = urlSimulationRunId || null;
 
-  const VALID_VIEWS = ['home','qa','report','multi','workflow','simulation','evaluation','alert','guide','planning'];
+  const VALID_VIEWS = ['home','qa','report','multi','workflow','simulation','evaluation','alert','guide','planning','operations'];
   const [activeSessionId, setActiveSessionId] = useState<string | null>(initialSessionId);
   const [pendingCreate, setPendingCreate] = useState(!initialSessionId);
   const [view, setView] = useState(() => {
@@ -472,8 +474,9 @@ export default function App() {
 
   return (
     <LayoutShell judgments={judgments} judgmentsLoading={judgmentsLoading} judgmentsError={judgmentsError} onOpenJudgment={handleOpenCollaborationSession} activeView={view} onNavigate={handleNavigate} onRecentClick={handleRecentClick} onNewConversation={handleNewConversation} onRenameSession={handleRenameSession} onDeleteSession={handleDeleteSession} activeConvId={activeSessionId || undefined} recentList={recentItems}>
-      <div style={view === 'simulation' ? { width: '100%', padding: '16px 24px 32px' } as React.CSSProperties : { maxWidth: 960, margin: '0 auto', width: '100%', padding: '0 24px 32px' }}>
-        {view === 'alert' ? <AlertDashboard onOpenEvent={handleOpenTrafficEvent} onOpenRoad={handleOpenTrafficRoad} onOpenRun={handleOpenWorkflowRun} /> :
+      <div style={view === 'simulation' || view === 'operations' ? { width: '100%', padding: '16px 24px 32px' } as React.CSSProperties : { maxWidth: 960, margin: '0 auto', width: '100%', padding: '0 24px 32px' }}>
+        {view === 'operations' ? <OperationsWorkspace onOpenEvent={handleOpenTrafficEvent} onOpenWorkflow={handleOpenWorkflowRun} /> :
+         view === 'alert' ? <AlertDashboard onOpenEvent={handleOpenTrafficEvent} onOpenRoad={handleOpenTrafficRoad} onOpenRun={handleOpenWorkflowRun} /> :
          view === 'guide' ? <GuidePage /> :
          view === 'report' ? <ReportDashboard onOpenRoad={handleOpenTrafficRoad} onOpenRisk={handleOpenTrafficRisk} /> :
          view === 'qa' ? <KnowledgeWorkspace onRefresh={refreshSessions} activeSessionId={activeSessionId || undefined} /> :

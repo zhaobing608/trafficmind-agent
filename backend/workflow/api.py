@@ -685,6 +685,8 @@ def _action_public_projection(action: Any, run: WorkflowRun) -> Dict[str, Any]:
         "result": public_result,
         "error": sanitize_public_text(action.error) or None,
         "lastReconciledAt": action.last_reconciled_at or None,
+        "unknownSince": action.unknown_since or None,
+        "reconciliationAttempts": int(action.reconciliation_attempts or 0),
         "reconciliationSupported": bool(action.reconciliation_supported),
         "reconciliationMessage": sanitize_public_text(
             action.reconciliation_message

@@ -789,6 +789,22 @@ async def reconcile_action_execution(
         reason = applied.get("reason") or "concurrent_change"
         code = "not_found" if reason in {"not_found", "run_not_found"} else "invalid_status"
         return {"errorCode": code, "error": f"reconciliation 未提交: {reason}"}
+    try:
+        from backend.observability.logging import log_runtime_event
+        log_runtime_event(
+            component="workflow.action",
+            operation="action_reconciliation_completed",
+            status=outcome.status.value,
+            event_id=record.event_id,
+            workflow_run_id=run_id,
+            action_execution_id=action_execution_id,
+            actionType=record.action_type,
+            attempt=int(record.attempt or 0),
+            reconciliationSupported=bool(outcome.reconciliation_supported),
+            error=sanitize_public_text(outcome.error) or None,
+        )
+    except Exception:
+        pass
     if not outcome.reconciliation_supported:
         return {
             **applied,

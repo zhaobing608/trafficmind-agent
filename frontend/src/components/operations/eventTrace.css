@@ -1,0 +1,24 @@
+.event-trace { padding-top: 15px; margin-top: 15px; border-top: 1px solid #e3e9e7; color: #243c3a; }
+.event-trace-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.event-trace-heading h3, .event-trace-placeholder h3 { margin: 0; font-size: 13px; font-weight: 650; }
+.event-trace-heading p, .event-trace-placeholder p { margin: 4px 0 0; color: #6c7e7b; font-size: 11px; line-height: 1.5; }
+.event-trace-counts { display: flex; align-items: center; justify-content: flex-end; gap: 5px; flex-wrap: wrap; }
+.event-trace-counts span { padding: 2px 6px; border: 1px solid #dce5e3; border-radius: 5px; color: #647873; background: #f8faf9; font-size: 10px; }
+.event-trace-list { list-style: none; margin: 13px 0 0; padding: 0; }
+.event-trace-list li { position: relative; display: grid; grid-template-columns: 13px minmax(0, 1fr); gap: 9px; padding-bottom: 13px; }
+.event-trace-list li:not(:last-child)::before { content: ''; position: absolute; left: 5px; top: 11px; bottom: -2px; width: 1px; background: #dce5e3; }
+.event-trace-marker { position: relative; z-index: 1; width: 11px; height: 11px; margin-top: 4px; border: 2px solid #267b70; border-radius: 999px; background: #fff; }
+.event-trace-item { min-width: 0; }
+.event-trace-item-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.event-trace-item-head time { color: #6c7e7b; font-size: 10px; font-variant-numeric: tabular-nums; }
+.event-trace-item-head code { padding: 1px 5px; border-radius: 4px; color: #365f59; background: #eef8f5; font-size: 10px; overflow-wrap: anywhere; }
+.event-trace-status { padding: 1px 5px; border: 1px solid #e2e8f0; border-radius: 4px; color: #475569; background: #f8fafc; font-size: 10px; overflow-wrap: anywhere; }
+.event-trace-item > strong { display: block; margin-top: 4px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.event-trace-item > p { margin: 2px 0 0; color: #788986; font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.event-trace-links { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+.event-trace-links button, .event-trace-placeholder button { max-width: 100%; padding: 0; border: 0; color: #187d70; background: transparent; cursor: pointer; font-size: 10px; text-align: left; overflow-wrap: anywhere; }
+.event-trace-footer { padding-top: 6px; border-top: 1px dashed #dce5e3; color: #7a8884; font-size: 10px; }
+.event-trace-empty { padding: 22px 12px; color: #7a8881; text-align: center; font-size: 12px; }
+.event-trace-placeholder { min-height: 86px; }
+.event-trace-placeholder [role="alert"] { color: #a34234; }
+.event-trace button:focus-visible { outline: 2px solid #187d70; outline-offset: 2px; }

@@ -713,6 +713,8 @@ class WorkflowActionRecord:
     request_metadata: Dict[str, Any] = field(default_factory=dict)
     external_reference: str = ""
     last_reconciled_at: str = ""
+    unknown_since: str = ""
+    reconciliation_attempts: int = 0
     reconciliation_supported: bool = False
     retryable: bool = False
     reconciliation_message: str = ""
@@ -759,6 +761,8 @@ class WorkflowActionRecord:
             "finishedAt": self.finished_at or self.completed_at,
             "externalReference": self.external_reference or None,
             "lastReconciledAt": self.last_reconciled_at or None,
+            "unknownSince": self.unknown_since or None,
+            "reconciliationAttempts": int(self.reconciliation_attempts or 0),
             "reconciliationSupported": self.reconciliation_supported,
             "retryable": self.retryable,
             "reconciliationMessage": self.reconciliation_message or None,
@@ -786,6 +790,8 @@ class WorkflowActionRecord:
             request_metadata=d.get("requestMetadata", {}),
             external_reference=d.get("externalReference", "") or "",
             last_reconciled_at=d.get("lastReconciledAt", "") or "",
+            unknown_since=d.get("unknownSince", "") or "",
+            reconciliation_attempts=int(d.get("reconciliationAttempts", 0) or 0),
             reconciliation_supported=bool(d.get("reconciliationSupported", False)),
             retryable=bool(d.get("retryable", False)),
             reconciliation_message=d.get("reconciliationMessage", "") or "",

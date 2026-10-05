@@ -988,6 +988,26 @@ async def execute_action(
         "status": status.value,
         "idempotencyKey": idempotency_key,
     })
+    try:
+        from backend.observability.logging import log_runtime_event
+        log_runtime_event(
+            component="workflow.action",
+            operation=(
+                "action_execution_failed"
+                if status in {ActionStatus.FAILED, ActionStatus.UNKNOWN}
+                else "action_execution_completed"
+            ),
+            status=status.value,
+            event_id=event_id,
+            workflow_run_id=state.workflow_run_id,
+            action_execution_id=action_id,
+            actionType=canonical_action_type,
+            attempt=int(record.attempt or 1),
+            error=error or None,
+        )
+    except Exception:
+        # Observability must never change the action result or execution fence.
+        pass
 
     response = {
         "action_id": action_id,

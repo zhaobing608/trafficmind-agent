@@ -3,7 +3,7 @@
 多 Agent 协作的单一运行实例状态管理。
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 VALID_STATUSES = {
@@ -67,7 +67,8 @@ class CollaborationRunState:
 
         # Timestamps
         self.started_at: str = ""
-        self.updated_at: str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        self.updated_at: str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.completed_at: str = ""
 
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
@@ -81,9 +82,11 @@ class CollaborationRunState:
         if new_status not in allowed:
             raise ValueError(f"非法状态转换: '{self.status}' → '{new_status}'。允许: {sorted(allowed)}")
         self.status = new_status
-        self.updated_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        self.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if new_status == "running" and not self.started_at:
             self.started_at = self.updated_at
+        if new_status in TERMINAL_STATUSES:
+            self.completed_at = self.updated_at
 
     def record_agent_result(self, agent_name: str, result: Dict[str, Any]):
         self.task_results[agent_name] = result
@@ -120,4 +123,5 @@ class CollaborationRunState:
             "budget_usage": self.budget_usage,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
+            "completed_at": self.completed_at,
         }

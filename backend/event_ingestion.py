@@ -66,6 +66,45 @@ def _parse_record(row: sqlite3.Row) -> Dict[str, Any]:
     return record
 
 
+def _record_ingestion_audit_conn(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    source: str,
+    source_event_id: str,
+    outcome: str,
+    revision: int,
+    occurred_at: str,
+    created_at: str,
+) -> None:
+    """Persist one bounded ingestion fact without copying the raw payload."""
+    conn.execute(
+        """INSERT INTO event_ingestion_audit (
+               event_id, source, source_event_id, outcome, revision,
+               occurred_at, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            event_id,
+            source,
+            source_event_id,
+            outcome,
+            int(revision or 1),
+            occurred_at,
+            created_at,
+        ),
+    )
+
+
+def _record_ingestion_audit(**values: Any) -> None:
+    """Best-effort audit for a concurrent winner already committed elsewhere."""
+    conn = get_connection()
+    try:
+        _record_ingestion_audit_conn(conn, **values)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_event_by_source_identity(source: str, source_event_id: str) -> Optional[Dict[str, Any]]:
     """Read an event by its stable upstream identity."""
     init_db()
@@ -138,6 +177,16 @@ def ingest_event(
             conn.execute(
                 "UPDATE event_records SET lastReceivedAt=? WHERE eventId=?",
                 (received_at, existing["eventId"]),
+            )
+            _record_ingestion_audit_conn(
+                conn,
+                event_id=existing["eventId"],
+                source=canonical_source,
+                source_event_id=upstream_id,
+                outcome="duplicate",
+                revision=int(existing["revision"] or 1),
+                occurred_at=occurred,
+                created_at=received_at,
             )
             conn.commit()
             record = get_event_by_id(existing["eventId"]) or _parse_record(existing)
@@ -237,6 +286,16 @@ def ingest_event(
                 (*values, received_at, event_id),
             )
             outcome = "updated"
+        _record_ingestion_audit_conn(
+            conn,
+            event_id=event_id,
+            source=canonical_source,
+            source_event_id=upstream_id,
+            outcome=outcome,
+            revision=revision,
+            occurred_at=occurred,
+            created_at=received_at,
+        )
         conn.commit()
     except sqlite3.IntegrityError as exc:
         conn.rollback()
@@ -244,6 +303,15 @@ def ingest_event(
         # it back and report duplicate truth rather than creating a second event.
         concurrent = get_event_by_source_identity(canonical_source, upstream_id)
         if concurrent is not None:
+            _record_ingestion_audit(
+                event_id=concurrent["eventId"],
+                source=canonical_source,
+                source_event_id=upstream_id,
+                outcome="duplicate",
+                revision=int(concurrent.get("revision") or 1),
+                occurred_at=occurred,
+                created_at=received_at,
+            )
             return {
                 "outcome": "duplicate",
                 "created": False,

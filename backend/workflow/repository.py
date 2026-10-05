@@ -64,6 +64,74 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _correlation_payload_tx(
+    conn: sqlite3.Connection,
+    run_id: str,
+    payload: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Attach durable correlation identities to a workflow audit payload.
+
+    Historical callers only supplied node-specific data.  Correlation is
+    resolved from the same transaction's run/action rows, never from log text
+    or a frontend guess.  Caller-supplied identities cannot override durable
+    Run/Action ownership.
+    """
+    correlated = dict(payload or {})
+    correlated["workflowRunId"] = run_id
+    run_event_id = ""
+    row = conn.execute(
+        "SELECT state_json FROM workflow_runs WHERE run_id=?",
+        (run_id,),
+    ).fetchone()
+    if row is not None:
+        try:
+            state = json.loads(row["state_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            state = {}
+        current = state.get("currentEvent") if isinstance(state, dict) else {}
+        if isinstance(current, dict):
+            run_event_id = str(current.get("eventId") or "").strip()
+
+    action_id = str(
+        correlated.get("actionExecutionId")
+        or correlated.get("actionId")
+        or ""
+    ).strip()
+    action_event_id = ""
+    if action_id:
+        action = conn.execute(
+            "SELECT run_id, event_id FROM workflow_action_records WHERE action_id=?",
+            (action_id,),
+        ).fetchone()
+        if action is not None and str(action["run_id"] or "") != run_id:
+            # Never let an Action owned by another Run cross-link this audit.
+            correlated.pop("actionExecutionId", None)
+            correlated.pop("actionId", None)
+        else:
+            # A not-yet-created deterministic ID is legitimate for a blocked
+            # Action; once a row exists, ownership above is mandatory.
+            correlated["actionExecutionId"] = action_id
+            if action is not None:
+                action_event_id = str(action["event_id"] or "").strip()
+                if (
+                    run_event_id
+                    and action_event_id
+                    and action_event_id != run_event_id
+                ):
+                    # A corrupt/legacy Action row can belong to this Run while
+                    # carrying another Event identity.  Do not let that row
+                    # cross-link either Event's audit graph.
+                    correlated.pop("actionExecutionId", None)
+                    correlated.pop("actionId", None)
+                    action_event_id = ""
+
+    # The Run is the primary Event binding.  An owned Action may fill a legacy
+    # missing binding, but an explicit payload can never introduce another
+    # Event identity.
+    correlated["eventId"] = run_event_id or action_event_id or None
+    return correlated
+
+
 def _append_event_tx(
     conn: sqlite3.Connection,
     run_id: str,
@@ -83,7 +151,7 @@ def _append_event_tx(
         run_id=run_id,
         node_id=node_id,
         event_type=event_type,
-        payload=dict(payload or {}),
+        payload=_correlation_payload_tx(conn, run_id, payload),
         sequence=sequence,
     )
     conn.execute(
@@ -128,7 +196,10 @@ def _apply_action_finalization_tx(
         """UPDATE workflow_action_records SET
                status=?, result_json=?, error=?, completed_at=?, finished_at=?,
                external_reference=?, reconciliation_supported=?, retryable=?,
-               reconciliation_message=?
+               reconciliation_message=?,
+               unknown_since=CASE WHEN ?='unknown'
+                   THEN COALESCE(NULLIF(unknown_since, ''), ?)
+                   ELSE '' END
            WHERE action_id=? AND attempt=? AND status IN ('running','executing')""",
         (
             status,
@@ -140,6 +211,8 @@ def _apply_action_finalization_tx(
             reconciliation_supported,
             retryable,
             reconciliation_message,
+            status,
+            finished_at,
             action_id,
             attempt,
         ),
@@ -405,6 +478,8 @@ def init_workflow_tables() -> None:
             request_metadata_json TEXT DEFAULT '{}',
             external_reference TEXT DEFAULT '',
             last_reconciled_at TEXT DEFAULT '',
+            unknown_since TEXT DEFAULT '',
+            reconciliation_attempts INTEGER DEFAULT 0,
             reconciliation_supported INTEGER DEFAULT 0,
             retryable INTEGER DEFAULT 0,
             reconciliation_message TEXT DEFAULT ''
@@ -452,7 +527,9 @@ def init_workflow_tables() -> None:
         CREATE INDEX IF NOT EXISTS idx_wf_runs_status ON workflow_runs(status);
         CREATE INDEX IF NOT EXISTS idx_wf_node_runs_run ON workflow_node_runs(run_id);
         CREATE INDEX IF NOT EXISTS idx_wf_events_run ON workflow_events(run_id);
+        CREATE INDEX IF NOT EXISTS idx_wf_events_run_sequence ON workflow_events(run_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_wf_approvals_run ON workflow_approvals(run_id);
+        CREATE INDEX IF NOT EXISTS idx_wf_approvals_pending_created ON workflow_approvals(decision, created_at);
         CREATE INDEX IF NOT EXISTS idx_wf_actions_run ON workflow_action_records(run_id);
         CREATE INDEX IF NOT EXISTS idx_wf_actions_idem ON workflow_action_records(idempotency_key);
         CREATE INDEX IF NOT EXISTS idx_wf_action_attempts_action ON workflow_action_attempts(action_id, attempt);
@@ -472,6 +549,8 @@ def init_workflow_tables() -> None:
         "request_metadata_json": "TEXT DEFAULT '{}'",
         "external_reference": "TEXT DEFAULT ''",
         "last_reconciled_at": "TEXT DEFAULT ''",
+        "unknown_since": "TEXT DEFAULT ''",
+        "reconciliation_attempts": "INTEGER DEFAULT 0",
         "reconciliation_supported": "INTEGER DEFAULT 0",
         "retryable": "INTEGER DEFAULT 0",
         "reconciliation_message": "TEXT DEFAULT ''",
@@ -481,6 +560,27 @@ def init_workflow_tables() -> None:
             c.execute(
                 f"ALTER TABLE workflow_action_records ADD COLUMN {column_name} {column_def}"
             )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wf_actions_event "
+        "ON workflow_action_records(event_id)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wf_actions_status "
+        "ON workflow_action_records(status, unknown_since)"
+    )
+    # These expression indexes directly support the exact Event trace lookups
+    # already used by list_runs/list_plans.  The partial predicate protects
+    # legacy malformed JSON rows.
+    c.execute(
+        """CREATE INDEX IF NOT EXISTS idx_wf_runs_event_id
+           ON workflow_runs(json_extract(state_json, '$.currentEvent.eventId'))
+           WHERE json_valid(state_json)"""
+    )
+    c.execute(
+        """CREATE INDEX IF NOT EXISTS idx_wf_definitions_plan_event
+           ON workflow_definitions(json_extract(metadata_json, '$.plan.eventId'))
+           WHERE json_valid(metadata_json)"""
+    )
     # Rows written before 21.3 did not carry event_id.  Backfill only from the
     # same run's persisted canonical event; never infer across runs/events.
     c.execute(
@@ -766,7 +866,7 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
         if event_id:
             # Phase20 R2：按事件 ID 精确匹配（只读，无 schema 变更）。
             # 绑定源是 state_json 内 $.currentEvent.eventId（仅启动方提供时存在）。
-            query += " AND CASE WHEN json_valid(state_json) THEN json_extract(state_json, '$.currentEvent.eventId') END=?"
+            query += " AND json_valid(state_json) AND json_extract(state_json, '$.currentEvent.eventId')=?"
             params.append(event_id)
         query += " ORDER BY updated_at DESC, run_id DESC LIMIT ? OFFSET ?"
         params.append(limit)
@@ -797,7 +897,7 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             query += " AND status=?"
             params.append(status)
         if event_id:
-            query += " AND CASE WHEN json_valid(state_json) THEN json_extract(state_json, '$.currentEvent.eventId') END=?"
+            query += " AND json_valid(state_json) AND json_extract(state_json, '$.currentEvent.eventId')=?"
             params.append(event_id)
         row = conn.execute(query, params).fetchone()
         conn.close()
@@ -1005,13 +1105,43 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                                WHERE type='table' AND name='event_records'"""
                         ).fetchone()
                         if event_id and table_exists:
-                            conn.execute(
+                            previous = conn.execute(
+                                "SELECT status FROM event_records WHERE eventId=?",
+                                (event_id,),
+                            ).fetchone()
+                            completed_at = _utc_now_iso()
+                            advanced = conn.execute(
                                 """UPDATE event_records
                                    SET status='已处置', updatedAt=?
                                    WHERE eventId=?
                                      AND status IN ('待研判','待派单','处置中')""",
-                                (_utc_now_iso(), event_id),
+                                (completed_at, event_id),
                             )
+                            lifecycle_exists = conn.execute(
+                                """SELECT 1 FROM sqlite_master
+                                   WHERE type='table'
+                                     AND name='event_lifecycle_audit'"""
+                            ).fetchone()
+                            if (
+                                advanced.rowcount == 1
+                                and previous is not None
+                                and lifecycle_exists
+                            ):
+                                conn.execute(
+                                    """INSERT INTO event_lifecycle_audit (
+                                           event_id, event_type,
+                                           previous_status, status, actor,
+                                           created_at
+                                       ) VALUES (
+                                           ?, 'event_status_updated', ?,
+                                           '已处置', 'workflow_runtime', ?
+                                       )""",
+                                    (
+                                        event_id,
+                                        str(previous["status"] or ""),
+                                        completed_at,
+                                    ),
+                                )
             conn.commit()
             return True
         except Exception:
@@ -1134,7 +1264,7 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                 run_id=run_id,
                 node_id=node_id,
                 event_type=event_type,
-                payload=dict(payload or {}),
+                payload=_correlation_payload_tx(conn, run_id, payload),
                 sequence=sequence,
                 created_at=created_at,
             )
@@ -1471,8 +1601,9 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                    params_json, result_json, status, error, created_at, completed_at,
                    event_id, semantic_action_version, attempt, started_at, finished_at,
                    request_metadata_json, external_reference, last_reconciled_at,
+                   unknown_since, reconciliation_attempts,
                    reconciliation_supported, retryable, reconciliation_message
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(idempotency_key) DO UPDATE SET
                    action_id=excluded.action_id,
                    run_id=excluded.run_id,
@@ -1492,6 +1623,8 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                    request_metadata_json=excluded.request_metadata_json,
                    external_reference=excluded.external_reference,
                    last_reconciled_at=excluded.last_reconciled_at,
+                   unknown_since=excluded.unknown_since,
+                   reconciliation_attempts=excluded.reconciliation_attempts,
                    reconciliation_supported=excluded.reconciliation_supported,
                    retryable=excluded.retryable,
                    reconciliation_message=excluded.reconciliation_message
@@ -1517,6 +1650,8 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                 json.dumps(record.request_metadata, ensure_ascii=False),
                 record.external_reference,
                 record.last_reconciled_at,
+                record.unknown_since,
+                int(record.reconciliation_attempts or 0),
                 1 if record.reconciliation_supported else 0,
                 1 if record.retryable else 0,
                 record.reconciliation_message,
@@ -1626,6 +1761,8 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             request_metadata=request_metadata or {},
             external_reference=d.get("external_reference", "") or "",
             last_reconciled_at=d.get("last_reconciled_at", "") or "",
+            unknown_since=d.get("unknown_since", "") or "",
+            reconciliation_attempts=int(d.get("reconciliation_attempts", 0) or 0),
             reconciliation_supported=bool(d.get("reconciliation_supported", 0)),
             retryable=bool(d.get("retryable", 0)),
             reconciliation_message=d.get("reconciliation_message", "") or "",
@@ -2174,6 +2311,10 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                        status=?, result_json=?, error=?, external_reference=?,
                        last_reconciled_at=?, reconciliation_supported=?,
                        retryable=?, reconciliation_message=?,
+                       reconciliation_attempts=reconciliation_attempts + 1,
+                       unknown_since=CASE WHEN ?='unknown'
+                           THEN COALESCE(NULLIF(unknown_since, ''), ?)
+                           ELSE '' END,
                        finished_at=CASE WHEN ?='' THEN finished_at ELSE ? END,
                        completed_at=CASE WHEN ?='' THEN completed_at ELSE ? END
                    WHERE action_id=? AND status='unknown'""",
@@ -2186,6 +2327,8 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                     1 if supported else 0,
                     next_retryable,
                     str(message or "")[:500],
+                    status.value,
+                    now,
                     finished_at,
                     finished_at,
                     finished_at,
@@ -2427,11 +2570,18 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             if run is None:
                 conn.rollback()
                 return False
+            now = _utc_now_iso()
             conn.execute(
                 """UPDATE workflow_action_records SET
-                       status='unknown', error=?, reconciliation_message=?
+                       status='unknown', error=?, reconciliation_message=?,
+                       unknown_since=COALESCE(NULLIF(unknown_since, ''), ?)
                    WHERE action_id=? AND status IN ('running','executing')""",
-                (reason[:500], "reconciliation required before retry", action_id),
+                (
+                    reason[:500],
+                    "reconciliation required before retry",
+                    now,
+                    action_id,
+                ),
             )
             conn.execute(
                 """UPDATE workflow_action_attempts SET status='unknown', error=?
@@ -3237,9 +3387,10 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                 changed = conn.execute(
                     """UPDATE workflow_action_records SET
                            status='unknown', error=?, retryable=0,
-                           reconciliation_message='reconciliation required before retry'
+                           reconciliation_message='reconciliation required before retry',
+                           unknown_since=COALESCE(NULLIF(unknown_since, ''), ?)
                        WHERE action_id=? AND status IN ('running','executing')""",
-                    (reason, action["action_id"]),
+                    (reason, _utc_now_iso(), action["action_id"]),
                 )
                 if changed.rowcount != 1:
                     continue
@@ -3280,6 +3431,18 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             ).fetchall()
             for action in unprojected:
                 reason = action["error"] or "external outcome unknown; reconciliation required"
+                if not action["unknown_since"]:
+                    conn.execute(
+                        "UPDATE workflow_action_records SET unknown_since=? WHERE action_id=?",
+                        (
+                            action["finished_at"]
+                            or action["completed_at"]
+                            or action["started_at"]
+                            or action["created_at"]
+                            or _utc_now_iso(),
+                            action["action_id"],
+                        ),
+                    )
                 projected = _project_unknown_action_to_run_tx(
                     conn,
                     action["action_id"],
@@ -3372,7 +3535,7 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                 params.append(f"%{search.lower()}%")
             if event_id:
                 where.append(
-                    "CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.plan.eventId') END = ?"
+                    "json_valid(metadata_json) AND json_extract(metadata_json, '$.plan.eventId') = ?"
                 )
                 params.append(event_id)
             if status:

@@ -97,6 +97,9 @@ async def lifespan(app: FastAPI):
     # Phase 21: Traffic Case Memory tables (idempotent)
     from backend.case_memory.repository import init_case_memory_tables
     init_case_memory_tables()
+    # Phase 21.4: Runtime operations / durable operational alerts
+    from backend.observability.operations import init_operations_tables
+    init_operations_tables()
     # Phase 13 Round 2: Seed simulation_bridge template
     seed_workflow_templates()
     # Phase 12: Wait Scheduler
@@ -107,11 +110,15 @@ async def lifespan(app: FastAPI):
     from backend.workflow.run_driver import get_run_driver
     run_driver = get_run_driver()
     await run_driver.start()
+    from backend.observability.operations import get_operations_monitor
+    operations_monitor = get_operations_monitor()
+    await operations_monitor.start()
     llm_status = "已启用 (DeepSeek)" if LLM_ENABLED else "未配置，将使用本地模板"
     print(f"TrafficMind Agent 启动完成")
     print(f"  LLM 状态: {llm_status}")
     print(f"  API 文档: http://localhost:8000/docs")
     yield
+    await operations_monitor.stop()
     await run_driver.stop()
     await wait_scheduler.stop()
 
@@ -2017,8 +2024,14 @@ app.include_router(simulation_router)
 # Phase 14: Workflow Observability V1 Router
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from backend.observability.api import router as observability_router
+from backend.observability.api import (
+    router as observability_router,
+    operations_router,
+    event_trace_router,
+)
 app.include_router(observability_router)
+app.include_router(operations_router)
+app.include_router(event_trace_router)
 
 # Phase 14 Round 3: Evaluation Dashboard
 from backend.evaluation.eval_api import router as eval_router

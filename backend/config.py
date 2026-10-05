@@ -88,6 +88,20 @@ NOTIFY_ENABLED = bool(
     or (SMTP_HOST and SMTP_TO)
 )
 
+# -------------------- Runtime Operations / Observability --------------------
+
+# All thresholds are expressed in seconds and can be overridden per
+# deployment.  Keeping them here prevents alert semantics from drifting across
+# the scanner, APIs, and UI.
+OPERATIONS_SCAN_INTERVAL = float(os.getenv("OPERATIONS_SCAN_INTERVAL", "30"))
+UNKNOWN_ALERT_AFTER = float(os.getenv("UNKNOWN_ALERT_AFTER", "900"))
+WORKFLOW_STUCK_AFTER = float(os.getenv("WORKFLOW_STUCK_AFTER", "900"))
+APPROVAL_ATTENTION_AFTER = float(os.getenv("APPROVAL_ATTENTION_AFTER", "900"))
+APPROVAL_OVERDUE_AFTER = float(os.getenv("APPROVAL_OVERDUE_AFTER", "3600"))
+ACTION_REPEATED_FAILURE_THRESHOLD = int(
+    os.getenv("ACTION_REPEATED_FAILURE_THRESHOLD", "3")
+)
+
 # -------------------- Memory V2 配置 (Phase 10) --------------------
 
 # 存储后端: sqlite (当前) | postgres (Phase 11 预留)

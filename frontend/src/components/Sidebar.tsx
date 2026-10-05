@@ -7,6 +7,7 @@ import {
   BookOutlined,
   CarOutlined,
   CompassOutlined,
+  DashboardOutlined,
   DownOutlined,
   FileTextOutlined,
   MenuFoldOutlined,
@@ -33,6 +34,7 @@ const NAV_GROUPS = [
     items: [
       { key: 'planning', label: '处置方案', icon: <CompassOutlined /> },
       { key: 'workflow', label: '工作流', icon: <ApartmentOutlined /> },
+      { key: 'operations', label: '运行监控', icon: <DashboardOutlined /> },
     ],
   },
   {
