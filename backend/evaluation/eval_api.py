@@ -40,3 +40,10 @@ async def api_compare(base: str = Query(...), target: str = Query(...)):
     result = compare_reports(base, target)
     if result is None: raise HTTPException(status_code=404, detail="Report not found")
     return result
+
+
+@router.get("/feedback-pilot", summary="Run deterministic outcome-aware memory pilot")
+async def api_feedback_pilot():
+    from backend.evaluation.feedback_replay import run_feedback_pilot
+
+    return run_feedback_pilot()

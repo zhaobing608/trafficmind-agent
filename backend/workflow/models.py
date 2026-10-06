@@ -78,6 +78,19 @@ class ApprovalDecision(str, Enum):
     EDITED = "edited"
 
 
+class ApprovalReasonCode(str, Enum):
+    """Operator-supplied structured reason; never inferred by an Agent."""
+
+    NONE = "NONE"
+    UNSUPPORTED_ACTION = "UNSUPPORTED_ACTION"
+    TOO_HIGH_RISK = "TOO_HIGH_RISK"
+    INCORRECT_CONTEXT = "INCORRECT_CONTEXT"
+    UNNECESSARY = "UNNECESSARY"
+    DUPLICATE = "DUPLICATE"
+    OPERATOR_JUDGMENT = "OPERATOR_JUDGMENT"
+    OTHER = "OTHER"
+
+
 class ActionStatus(str, Enum):
     """Durable action-execution status.
 
@@ -632,12 +645,15 @@ class WorkflowApproval:
     decision: ApprovalDecision = ApprovalDecision.PENDING
     reviewer: str = ""
     comment: str = ""
+    reason_code: ApprovalReasonCode = ApprovalReasonCode.NONE
     created_at: str = ""
     decided_at: str = ""
 
     def __post_init__(self):
         if not self.created_at:
             self.created_at = _utc_now_iso()
+        if isinstance(self.reason_code, str):
+            self.reason_code = ApprovalReasonCode(self.reason_code or "NONE")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -649,6 +665,7 @@ class WorkflowApproval:
             "decision": self.decision.value,
             "reviewer": self.reviewer,
             "comment": self.comment,
+            "reasonCode": self.reason_code.value,
             "createdAt": self.created_at,
             "decidedAt": self.decided_at,
         }
@@ -664,6 +681,7 @@ class WorkflowApproval:
             decision=ApprovalDecision(d.get("decision", "pending")),
             reviewer=d.get("reviewer", ""),
             comment=d.get("comment", ""),
+            reason_code=ApprovalReasonCode(d.get("reasonCode", "NONE") or "NONE"),
             created_at=d.get("createdAt", ""),
             decided_at=d.get("decidedAt", ""),
         )

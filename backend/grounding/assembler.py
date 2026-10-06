@@ -342,6 +342,10 @@ class GroundedEventContextAssembler:
             for item in (context.get("cases") or [])[:MAX_CASES]
             if isinstance(item, dict)
         ]
+        positive_cases = [item for item in cases if item.get("experienceType") == "positive"]
+        partial_cases = [item for item in cases if item.get("experienceType") == "partial"]
+        negative_cases = [item for item in cases if item.get("experienceType") == "negative"]
+        unverified_cases = [item for item in cases if item.get("experienceType") == "unverified"]
         return CaseMemoryContext(
             status="READY" if cases else "EMPTY",
             scope={
@@ -353,13 +357,22 @@ class GroundedEventContextAssembler:
                 "retrievalPolicy": dict(context.get("retrievalPolicy") or {}),
             },
             cases=cases,
+            positiveCases=positive_cases,
+            partialCases=partial_cases,
+            negativeCases=negative_cases,
+            unverifiedCases=unverified_cases,
             total=int(context.get("total") or 0),
             provenance=self._provenance_from_binding(
                 binding,
                 source_type="traffic_case_memories",
                 as_of=context.get("asOf"),
                 query_model="event_bound_case_memory_context",
-                notes=["strict_past_completed_cases", "quality_validated_or_partial"],
+                notes=[
+                    "strict_past_completed_cases",
+                    "current_event_excluded",
+                    "future_feedback_masked",
+                    "outcome_aware_positive_negative_cases",
+                ],
             ),
         )
 
@@ -433,6 +446,8 @@ class GroundedEventContextAssembler:
                 "caseId": item.get("caseId"),
                 "sourceWorkflowRunId": item.get("sourceWorkflowRunId"),
                 "finalStatus": item.get("finalStatus"),
+                "qualityStatus": item.get("qualityStatus"),
+                "experienceType": item.get("experienceType"),
             })
         return [ref for ref in refs if any(v for k, v in ref.items() if k != "type")]
 
@@ -567,6 +582,29 @@ def _compact_knowledge_evidence(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _compact_case(item: Dict[str, Any]) -> Dict[str, Any]:
+    recommendation = (
+        item.get("recommendationFeedback")
+        if isinstance(item.get("recommendationFeedback"), dict)
+        else {}
+    )
+    final_plan = (
+        recommendation.get("finalPlan")
+        if isinstance(recommendation.get("finalPlan"), dict)
+        else {}
+    )
+    original = (
+        recommendation.get("originalRecommendation")
+        if isinstance(recommendation.get("originalRecommendation"), dict)
+        else {}
+    )
+    event_outcome = (
+        item.get("eventOutcome") if isinstance(item.get("eventOutcome"), dict) else {}
+    )
+    operator = (
+        event_outcome.get("operatorAssessment")
+        if isinstance(event_outcome.get("operatorAssessment"), dict)
+        else {}
+    )
     return {
         "caseId": item.get("caseId"),
         "eventId": item.get("eventId"),
@@ -579,8 +617,46 @@ def _compact_case(item: Dict[str, Any]) -> Dict[str, Any]:
         "sourcePlanId": item.get("sourcePlanId"),
         "finalStatus": item.get("finalStatus"),
         "qualityStatus": item.get("qualityStatus"),
+        "experienceType": item.get("experienceType"),
+        "whyRelevant": _short_text(item.get("whyRelevant")),
+        "retrievalScore": dict(item.get("retrievalScore") or {}),
         "generatedSummary": _short_text(item.get("generatedSummary")),
         "completedAt": item.get("completedAt"),
+        "recommendation": {
+            "status": recommendation.get("status"),
+            "planId": final_plan.get("planId") or original.get("planId"),
+            "planVersion": final_plan.get("planVersion"),
+            "proposedActions": list(original.get("actionRefs") or [])[:10],
+            "finalActions": list(final_plan.get("actions") or [])[:10],
+            "modifications": list(recommendation.get("modifications") or [])[:20],
+            "rejectionReasons": list(recommendation.get("rejectionReasons") or [])[:10],
+        },
+        "actionOutcomes": [
+            {
+                "actionType": action.get("actionType"),
+                "status": action.get("status"),
+                "approved": action.get("approved"),
+                "succeeded": action.get("succeeded"),
+                "failed": action.get("failed"),
+                "blocked": action.get("blocked"),
+                "enteredUnknown": action.get("enteredUnknown"),
+                "reconciled": action.get("reconciled"),
+                "retryCount": action.get("retryCount"),
+                "businessEffectiveness": action.get("businessEffectiveness"),
+                "finalAction": action.get("finalAction"),
+            }
+            for action in (item.get("actionFeedback") or [])[:20]
+            if isinstance(action, dict)
+        ],
+        "outcome": {
+            "eventOutcome": operator.get("outcome"),
+            "effectiveness": operator.get("effectiveness"),
+            "assessedAt": operator.get("assessedAt"),
+            "businessOutcomeConfirmed": event_outcome.get("businessOutcomeConfirmed"),
+        },
+        # This contains only structured durable reason/action codes; free-form
+        # operator comments are deliberately excluded from Agent context.
+        "caution": dict(item.get("caution") or {}),
         "lessonRefs": [
             {
                 "type": lesson.get("type"),

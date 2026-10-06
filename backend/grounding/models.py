@@ -101,6 +101,10 @@ class CaseMemoryContext(GroundingBaseModel):
     reason: str = ""
     scope: Dict[str, Any] = Field(default_factory=dict)
     cases: List[Dict[str, Any]] = Field(default_factory=list)
+    positiveCases: List[Dict[str, Any]] = Field(default_factory=list)
+    partialCases: List[Dict[str, Any]] = Field(default_factory=list)
+    negativeCases: List[Dict[str, Any]] = Field(default_factory=list)
+    unverifiedCases: List[Dict[str, Any]] = Field(default_factory=list)
     total: int = 0
     provenance: GroundingProvenance = Field(default_factory=GroundingProvenance)
 

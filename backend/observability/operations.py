@@ -752,6 +752,7 @@ def _workflow_runs(
                 "decision": approval.decision.value,
                 "reviewer": sanitize_public_text(approval.reviewer)[:200] or None,
                 "comment": sanitize_public_text(approval.comment)[:500] or None,
+                "reasonCode": approval.reason_code.value,
                 "createdAt": approval.created_at or None,
                 "decidedAt": approval.decided_at or None,
                 "waitingSeconds": age,
@@ -773,7 +774,11 @@ def _workflow_runs(
                     approval_id=approval.approval_id,
                     status=approval.decision.value,
                     summary="Operator approval decided",
-                    details={"reviewer": approval.reviewer, "comment": approval.comment},
+                    details={
+                        "reviewer": approval.reviewer,
+                        "comment": approval.comment,
+                        "reasonCode": approval.reason_code.value,
+                    },
                 ))
 
         projected.append({
@@ -946,6 +951,69 @@ def _lifecycle_timeline(
     ], int(total or 0)
 
 
+def _feedback_trace(
+    event_id: str,
+    *,
+    limit: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    """Project structured outcome feedback without exposing free-form comments."""
+
+    try:
+        from backend.case_memory.repository import SQLiteCaseMemoryRepository
+
+        repository = SQLiteCaseMemoryRepository()
+        all_feedback = repository.list_feedback_for_event(event_id)
+        cases = {
+            case.source_workflow_run_id: case
+            for case in repository.list_cases_for_source_event(event_id)
+        }
+    except Exception:
+        return [], [], 0
+    projected: List[Dict[str, Any]] = []
+    timeline: List[Dict[str, Any]] = []
+    for feedback in all_feedback[: max(1, int(limit))]:
+        case = cases.get(feedback.workflow_run_id)
+        item = {
+            "feedbackId": feedback.feedback_id,
+            "caseId": case.case_id if case else None,
+            "eventId": feedback.event_id,
+            "workflowRunId": feedback.workflow_run_id,
+            "agentRunId": feedback.agent_run_id,
+            "planId": feedback.plan_id,
+            "planVersion": feedback.plan_version,
+            "approvalId": feedback.approval_id,
+            "actionExecutionId": feedback.action_execution_id,
+            "eventOutcome": feedback.event_outcome.value,
+            "effectiveness": feedback.effectiveness.value,
+            "reasonCode": feedback.reason_code.value,
+            "lifecycle": feedback.lifecycle.value,
+            "qualityStatus": case.quality_status.value if case else None,
+            "updatedAt": feedback.updated_at,
+        }
+        projected.append(item)
+        timeline.append(_timeline_entry(
+            occurred_at=feedback.updated_at,
+            event_type="event_feedback_updated",
+            source="event_feedback",
+            source_id=feedback.feedback_id,
+            event_id=event_id,
+            workflow_run_id=feedback.workflow_run_id,
+            action_execution_id=feedback.action_execution_id or "",
+            approval_id=feedback.approval_id or "",
+            plan_id=feedback.plan_id or "",
+            status=feedback.effectiveness.value,
+            summary="Structured operator outcome recorded",
+            details={
+                "eventOutcome": feedback.event_outcome.value,
+                "effectiveness": feedback.effectiveness.value,
+                "reasonCode": feedback.reason_code.value,
+                "lifecycle": feedback.lifecycle.value,
+                "qualityStatus": case.quality_status.value if case else None,
+            },
+        ))
+    return projected, timeline, len(all_feedback)
+
+
 def build_event_trace(
     event_id: str,
     *,
@@ -978,11 +1046,15 @@ def build_event_trace(
     lifecycle_timeline, lifecycle_total = _lifecycle_timeline(
         canonical, limit=max(source_limit, 5000)
     )
+    feedback, feedback_timeline, feedback_total = _feedback_trace(
+        canonical, limit=source_limit
+    )
     entries = list(ingestion_timeline)
     entries.extend(lifecycle_timeline)
     entries.extend(agent_timeline)
     entries.extend(plan_timeline)
     entries.extend(workflow_timeline)
+    entries.extend(feedback_timeline)
     # Legacy rows predate ingestion audit.  Their persisted Event timestamps
     # still provide an honest lifecycle boundary without inventing a source.
     if not ingestion_timeline and (record.get("createdAt") or record.get("receivedAt")):
@@ -1008,6 +1080,7 @@ def build_event_trace(
             "truncated": plans_truncated,
         },
         "workflowRuns": {"returned": len(workflows), "total": workflow_total},
+        "feedback": {"returned": len(feedback), "total": feedback_total},
     }
     nested_truncated = any(
         bool(workflow.get("bounds", {}).get("truncated"))
@@ -1028,6 +1101,7 @@ def build_event_trace(
         "agentRuns": agents,
         "plans": plans,
         "workflowRuns": workflows,
+        "feedback": feedback,
         "correlation": {
             "eventId": canonical,
             "agentRunIds": list(dict.fromkeys(item["agentRunId"] for item in agents)),
@@ -1742,6 +1816,30 @@ def runtime_summary(*, now: Optional[datetime] = None) -> Dict[str, Any]:
     action_total = int(action["total"] or 0)
     action_succeeded = int(action["succeeded"] or 0)
     active_workflows = sum(workflow.get(key, 0) for key in ("pending", "running", "paused", "awaiting_approval"))
+    try:
+        from backend.case_memory.repository import SQLiteCaseMemoryRepository
+        feedback_summary = SQLiteCaseMemoryRepository().feedback_metrics()
+    except Exception:
+        # Operations health remains available during a partial rolling upgrade.
+        feedback_summary = {
+            "total": 0,
+            "lifecycle": {"complete": 0, "partial": 0, "pending": 0},
+            "recommendations": {
+                "accepted": 0, "modified": 0, "rejected": 0,
+                "acceptanceRate": None, "modificationRate": None,
+                "rejectionRate": None,
+            },
+            "effectiveResolutionRate": None,
+            "actions": {
+                "total": 0, "succeeded": 0, "failed": 0,
+                "businessAssessed": 0, "businessEffective": 0,
+                "successRate": None, "businessEffectivenessRate": None,
+            },
+            "cases": {
+                "verified": 0, "partial": 0, "failed": 0,
+                "incomplete": 0, "unverified": 0,
+            },
+        }
     return {
         "generatedAt": _iso(current),
         "activeEvents": int(event_counts["active"] or 0),
@@ -1798,6 +1896,7 @@ def runtime_summary(*, now: Optional[datetime] = None) -> Dict[str, Any]:
             "reconciliationSuccess": int(action["reconciliation_success"] or 0),
             "reconciliationUnresolved": int(action["reconciliation_unresolved"] or 0),
         },
+        "feedback": feedback_summary,
         "approvalAging": {"counts": aging_counts, "items": approval_items},
         "unknownActionAging": {"items": unknown_items},
         "trends": {

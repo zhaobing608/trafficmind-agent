@@ -24,11 +24,12 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from backend.agent.streaming import sse_event, sse_error
 from backend.workflow.models import (
     ApprovalDecision,
+    ApprovalReasonCode,
     DefinitionStatus,
     WorkflowApproval,
     WorkflowRun,
@@ -98,8 +99,9 @@ class RetryNodeRequest(BaseModel):
 class ApprovalRequest(BaseModel):
     """审批请求。"""
     action: str  # "approve", "reject", "edit_and_approve"
-    reviewer: Optional[str] = ""
-    comment: Optional[str] = ""
+    reviewer: Optional[str] = Field(default="", max_length=200)
+    comment: Optional[str] = Field(default="", max_length=1000)
+    reasonCode: Optional[ApprovalReasonCode] = ApprovalReasonCode.NONE
     editedActions: Optional[List[Dict[str, Any]]] = None
 
     model_config = ConfigDict(extra="forbid")
@@ -935,6 +937,9 @@ async def process_approval(run_id: str, approval_id: str, body: ApprovalRequest)
     executor = get_executor()
 
     action = body.action
+    reviewer = sanitize_public_text(body.reviewer or "")[:200]
+    comment = sanitize_public_text(body.comment or "")[:1000]
+    reason_code = (body.reasonCode or ApprovalReasonCode.NONE).value
     if action == "edit_and_approve" and contains_sensitive_key(
         body.editedActions or []
     ):
@@ -948,23 +953,24 @@ async def process_approval(run_id: str, approval_id: str, body: ApprovalRequest)
     if action == "approve":
         result = await executor.approve(
             run_id,
-            reviewer=body.reviewer or "",
-            comment=body.comment or "",
+            reviewer=reviewer,
+            comment=comment,
             approval_id=approval_id,
         )
     elif action == "reject":
         result = await executor.reject(
             run_id,
-            reviewer=body.reviewer or "",
-            comment=body.comment or "",
+            reviewer=reviewer,
+            comment=comment,
+            reason_code=reason_code,
             approval_id=approval_id,
         )
     elif action == "edit_and_approve":
         result = await executor.edit_and_approve(
             run_id,
             edited_actions=body.editedActions or [],
-            reviewer=body.reviewer or "",
-            comment=body.comment or "",
+            reviewer=reviewer,
+            comment=comment,
             approval_id=approval_id,
         )
     else:

@@ -40,6 +40,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 from backend.workflow.models import (
     ActionStatus,
     ApprovalDecision,
+    ApprovalReasonCode,
     NodeConfig,
     NodeStatus,
     NodeType,
@@ -62,7 +63,7 @@ from backend.workflow.condition import (
 from backend.workflow.nodes.base import get_node_registry
 from backend.workflow.nodes import register_all_nodes
 from backend.workflow.errors import DriverLeaseLost
-from backend.workflow.action_execution import contains_sensitive_key
+from backend.workflow.action_execution import contains_sensitive_key, sanitize_public_text
 
 
 def _utc_now_iso() -> str:
@@ -454,6 +455,7 @@ class WorkflowExecutor:
                 action_record.action_id,
                 reason="run cancelled after dispatch; external outcome unknown",
             )
+        self._project_terminal_case_memory(run_id)
         return {
             "runId": run_id,
             "status": "cancelled",
@@ -473,10 +475,10 @@ class WorkflowExecutor:
         )
 
     async def reject(self, run_id: str, reviewer: str = "", comment: str = "",
-                     approval_id: str = "") -> Dict[str, Any]:
+                     approval_id: str = "", reason_code: str = "NONE") -> Dict[str, Any]:
         return await self._process_approval(
             run_id, ApprovalDecision.REJECTED, reviewer=reviewer, comment=comment,
-            expected_approval_id=approval_id,
+            expected_approval_id=approval_id, reason_code=reason_code,
         )
 
     async def edit_and_approve(
@@ -492,8 +494,17 @@ class WorkflowExecutor:
     async def _process_approval(
         self, run_id: str, decision: ApprovalDecision,
         edited_actions: list = None, reviewer: str = "", comment: str = "",
-        expected_approval_id: str = "",
+        expected_approval_id: str = "", reason_code: str = "NONE",
     ) -> Dict[str, Any]:
+        reviewer = sanitize_public_text(reviewer)[:200]
+        comment = sanitize_public_text(comment)[:1000]
+        try:
+            structured_reason = ApprovalReasonCode(reason_code or "NONE")
+        except ValueError:
+            return {
+                "error": "不支持的结构化审批原因",
+                "errorCode": "invalid_parameters",
+            }
         if (
             decision == ApprovalDecision.EDITED
             and contains_sensitive_key(edited_actions or [])
@@ -569,6 +580,7 @@ class WorkflowExecutor:
             proposed_actions=pending.get("proposedActions", []),
             edited_actions=edited_actions or [],
             decision=decision, reviewer=reviewer, comment=comment,
+            reason_code=structured_reason,
             created_at=durable_approval.created_at,
             decided_at=_utc_now_iso(),
         )
@@ -599,6 +611,7 @@ class WorkflowExecutor:
                 "approvalId": approval_id,
                 "decision": decision.value,
                 "reviewer": reviewer,
+                "reasonCode": structured_reason.value,
             },
         }]
         if decision == ApprovalDecision.REJECTED:
@@ -609,6 +622,7 @@ class WorkflowExecutor:
                     "approvalId": approval_id,
                     "reviewer": reviewer,
                     "comment": comment,
+                    "reasonCode": structured_reason.value,
                     "reason": comment or "人工审批驳回",
                 },
             })
@@ -633,6 +647,8 @@ class WorkflowExecutor:
                 "error": f"审批 {approval_id} 已被处理，请刷新后确认",
                 "errorCode": "approval_not_pending",
             }
+        if decision == ApprovalDecision.REJECTED:
+            self._project_terminal_case_memory(run_id)
         return {
             **result,
             "runId": run_id,
@@ -1644,6 +1660,50 @@ class WorkflowExecutor:
         self._prepare_run_checkpoint(run, state)
         # Phase17 Round3: driver-managed run → atomic fenced write（防 stale worker clobber）
         self._persist_run_state(run)
+        if run.is_terminal():
+            self._project_terminal_case_memory(run.run_id)
+
+    def _project_terminal_case_memory(self, run_id: str) -> None:
+        """Best-effort terminal projection; never weakens Workflow durability.
+
+        A canonical region may legitimately be unresolved at completion.  The
+        Workflow remains closed and queryable in that case; a later explicit
+        rebuild can materialise the Case after location resolution.
+        """
+
+        if not isinstance(self.repo, SQLiteWorkflowRepository):
+            return
+        try:
+            from backend.case_memory.builder import TrafficCaseBuilder
+            from backend.case_memory.repository import SQLiteCaseMemoryRepository
+            from backend.case_memory.service import TrafficCaseMemoryService
+
+            case_repository = SQLiteCaseMemoryRepository()
+            service = TrafficCaseMemoryService(
+                repository=case_repository,
+                builder=TrafficCaseBuilder(
+                    workflow_repo=self.repo,
+                    feedback_repository=case_repository,
+                ),
+            )
+            service.build_from_workflow_run(run_id, rebuild=True)
+        except Exception as exc:
+            # Case Memory is a derived read model.  Missing canonical location,
+            # an unavailable source chain, or projection failure must not roll
+            # back an already-durable terminal Workflow.
+            try:
+                from backend.observability.logging import log_runtime_event
+
+                log_runtime_event(
+                    component="case_memory",
+                    operation="terminal_projection",
+                    status="pending",
+                    workflow_run_id=run_id,
+                    errorType=type(exc).__name__,
+                )
+            except Exception:
+                pass
+            return
 
     def _persist_run_state(self, run: WorkflowRun) -> None:
         """driver-managed 用 fenced write；失败 → lease_lost。legacy 用 save_run。"""

@@ -2042,8 +2042,9 @@ from backend.regional.api import router as regional_router
 app.include_router(regional_router)
 
 # Phase 21: Traffic Case Memory
-from backend.case_memory.api import router as case_memory_router
+from backend.case_memory.api import feedback_router, router as case_memory_router
 app.include_router(case_memory_router)
+app.include_router(feedback_router)
 
 
 def _safe_json(s: str):

@@ -26,6 +26,7 @@ import backend.config as _config
 from backend.workflow.models import (
     ActionStatus,
     ApprovalDecision,
+    ApprovalReasonCode,
     DefinitionStatus,
     NodeConfig,
     NodeStatus,
@@ -56,6 +57,10 @@ def _get_conn() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(_config.DB_PATH), exist_ok=True)
     conn = sqlite3.connect(_config.DB_PATH)
     conn.row_factory = sqlite3.Row
+    # Schema upgrades can start concurrently in multiple API/worker
+    # processes.  Wait for the current migrator instead of failing on the
+    # transient write lock.
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
@@ -454,6 +459,7 @@ def init_workflow_tables() -> None:
             decision TEXT DEFAULT 'pending',
             reviewer TEXT DEFAULT '',
             comment TEXT DEFAULT '',
+            reason_code TEXT DEFAULT 'NONE',
             created_at TEXT DEFAULT '',
             decided_at TEXT DEFAULT ''
         );
@@ -536,6 +542,10 @@ def init_workflow_tables() -> None:
         CREATE INDEX IF NOT EXISTS idx_wf_dispatch_event ON workflow_dispatch_tasks(event_id);
         CREATE INDEX IF NOT EXISTS idx_wf_versions_def ON workflow_definition_versions(definition_id, version);
     """)
+    # Serialize the inspect/ALTER sequence across processes.  A process-local
+    # lock is insufficient here: without an immediate transaction, two fresh
+    # workers can both observe a missing column and then race the same ALTER.
+    c.execute("BEGIN IMMEDIATE")
     # Non-destructive migration for databases created before Phase 21.3.
     existing_action_columns = {
         row[1] for row in c.execute("PRAGMA table_info(workflow_action_records)").fetchall()
@@ -560,6 +570,13 @@ def init_workflow_tables() -> None:
             c.execute(
                 f"ALTER TABLE workflow_action_records ADD COLUMN {column_name} {column_def}"
             )
+    existing_approval_columns = {
+        row[1] for row in c.execute("PRAGMA table_info(workflow_approvals)").fetchall()
+    }
+    if "reason_code" not in existing_approval_columns:
+        c.execute(
+            "ALTER TABLE workflow_approvals ADD COLUMN reason_code TEXT DEFAULT 'NONE'"
+        )
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_wf_actions_event "
         "ON workflow_action_records(event_id)"
@@ -1332,7 +1349,11 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
         init_workflow_tables()
         conn = _get_conn()
         conn.execute(
-            """INSERT INTO workflow_approvals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO workflow_approvals (
+                   approval_id, run_id, node_id, proposed_actions_json,
+                   edited_actions_json, decision, reviewer, comment,
+                   reason_code, created_at, decided_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(approval_id) DO UPDATE SET
                    run_id=excluded.run_id,
                    node_id=excluded.node_id,
@@ -1341,6 +1362,7 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                    decision=excluded.decision,
                    reviewer=excluded.reviewer,
                    comment=excluded.comment,
+                   reason_code=excluded.reason_code,
                    decided_at=excluded.decided_at""",
             (
                 approval.approval_id,
@@ -1351,6 +1373,7 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                 approval.decision.value,
                 approval.reviewer,
                 approval.comment,
+                approval.reason_code.value,
                 approval.created_at,
                 approval.decided_at,
             ),
@@ -1365,13 +1388,15 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
         try:
             cursor = conn.execute(
                 """UPDATE workflow_approvals SET
-                       edited_actions_json=?, decision=?, reviewer=?, comment=?, decided_at=?
+                       edited_actions_json=?, decision=?, reviewer=?, comment=?,
+                       reason_code=?, decided_at=?
                    WHERE approval_id=? AND run_id=? AND decision='pending'""",
                 (
                     json.dumps(approval.edited_actions, ensure_ascii=False),
                     approval.decision.value,
                     approval.reviewer,
                     approval.comment,
+                    approval.reason_code.value,
                     approval.decided_at,
                     approval.approval_id,
                     approval.run_id,
@@ -1429,7 +1454,11 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             ).fetchone()
             if existing is None:
                 conn.execute(
-                    """INSERT INTO workflow_approvals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO workflow_approvals (
+                           approval_id, run_id, node_id, proposed_actions_json,
+                           edited_actions_json, decision, reviewer, comment,
+                           reason_code, created_at, decided_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         approval.approval_id,
                         approval.run_id,
@@ -1439,6 +1468,7 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
                         ApprovalDecision.PENDING.value,
                         "",
                         "",
+                        ApprovalReasonCode.NONE.value,
                         approval.created_at,
                         "",
                     ),
@@ -1452,13 +1482,15 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
 
             approval_update = conn.execute(
                 """UPDATE workflow_approvals SET
-                       edited_actions_json=?, decision=?, reviewer=?, comment=?, decided_at=?
+                       edited_actions_json=?, decision=?, reviewer=?, comment=?,
+                       reason_code=?, decided_at=?
                    WHERE approval_id=? AND run_id=? AND decision='pending'""",
                 (
                     json.dumps(approval.edited_actions, ensure_ascii=False),
                     approval.decision.value,
                     approval.reviewer,
                     approval.comment,
+                    approval.reason_code.value,
                     approval.decided_at,
                     approval.approval_id,
                     approval.run_id,
@@ -1586,6 +1618,7 @@ class SQLiteWorkflowRepository(AbstractWorkflowRepository):
             decision=ApprovalDecision(d.get("decision", "pending")),
             reviewer=d.get("reviewer", ""),
             comment=d.get("comment", ""),
+            reason_code=ApprovalReasonCode(d.get("reason_code", "NONE") or "NONE"),
             created_at=d.get("created_at", ""),
             decided_at=d.get("decided_at", ""),
         )

@@ -242,7 +242,7 @@ def _insert_case(
     region_id: str = "TEST_REGION_A",
     road_id: str = "ROAD_A_PEOPLE",
     intersection_id: str = "INT_A_PEOPLE_LIBERATION",
-    event_id: str = "E_CASE_SRC",
+    event_id: str | None = None,
     event_type: str = "accident",
     completed_at: str = "2026-06-20T08:00:00Z",
     quality: CaseMemoryQuality = CaseMemoryQuality.VALIDATED,
@@ -250,7 +250,7 @@ def _insert_case(
     repo.insert_case(TrafficCaseMemory(
         case_id=case_id,
         region_id=region_id,
-        event_id=event_id,
+        event_id=event_id or f"E_{case_id}",
         event_type=event_type,
         road_id=road_id,
         intersection_id=intersection_id,
