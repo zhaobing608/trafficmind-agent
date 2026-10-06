@@ -88,7 +88,7 @@
       "createdAt": "2026-09-04T14:00:00Z",
       "eventId": "SYN_QT_HOLDOUT_0001",
       "eventType": "accident",
-      "fusionHash": "13df058e398dea66",
+      "fusionHash": "8074d79494c09602",
       "groundedRecommendationCoverage": 0,
       "grounding": {
         "caseCount": 0,
@@ -130,13 +130,13 @@
       ]
     },
     {
-      "agentOutputHash": "ee5e5ed58d7cf6ea",
+      "agentOutputHash": "4719dc17e2cad62a",
       "agentRunStatus": "completed",
       "brokenEvidenceRefCount": 0,
       "createdAt": "2026-09-04T14:00:00Z",
       "eventId": "SYN_QT_HOLDOUT_0001",
       "eventType": "accident",
-      "fusionHash": "bccee133415a66a0",
+      "fusionHash": "c859d52028e9a243",
       "groundedRecommendationCoverage": 3,
       "grounding": {
         "caseCount": 2,
@@ -188,7 +188,7 @@
       "createdAt": "2026-09-04T14:00:00Z",
       "eventId": "SYN_QT_HOLDOUT_0001",
       "eventType": "accident",
-      "fusionHash": "4c16fd8f92791da5",
+      "fusionHash": "a7eec57f23c99497",
       "groundedRecommendationCoverage": 3,
       "grounding": {
         "caseCount": 0,
@@ -237,7 +237,7 @@
       "createdAt": "2026-09-04T14:00:00Z",
       "eventId": "SYN_QT_HOLDOUT_0001",
       "eventType": "accident",
-      "fusionHash": "06b811d2474d9957",
+      "fusionHash": "3c7d0c1d31421cfe",
       "groundedRecommendationCoverage": 3,
       "grounding": {
         "caseCount": 0,
@@ -288,7 +288,7 @@
       "createdAt": "2026-09-05T00:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0002",
       "eventType": "congestion",
-      "fusionHash": "451f6629f427cfa1",
+      "fusionHash": "eed822fe17b44785",
       "groundedRecommendationCoverage": 0,
       "grounding": {
         "caseCount": 0,
@@ -330,13 +330,13 @@
       ]
     },
     {
-      "agentOutputHash": "52b1ee5591174fd8",
+      "agentOutputHash": "f79b8089851f2a65",
       "agentRunStatus": "completed",
       "brokenEvidenceRefCount": 0,
       "createdAt": "2026-09-05T00:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0002",
       "eventType": "congestion",
-      "fusionHash": "80014366f845e644",
+      "fusionHash": "07102265429379a8",
       "groundedRecommendationCoverage": 2,
       "grounding": {
         "caseCount": 1,
@@ -388,7 +388,7 @@
       "createdAt": "2026-09-05T00:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0002",
       "eventType": "congestion",
-      "fusionHash": "393727a8252f86f0",
+      "fusionHash": "6ff2309a1a991201",
       "groundedRecommendationCoverage": 2,
       "grounding": {
         "caseCount": 0,
@@ -437,7 +437,7 @@
       "createdAt": "2026-09-05T00:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0002",
       "eventType": "congestion",
-      "fusionHash": "92845fe23b819587",
+      "fusionHash": "303fd2625a8543bf",
       "groundedRecommendationCoverage": 2,
       "grounding": {
         "caseCount": 0,
@@ -488,7 +488,7 @@
       "createdAt": "2026-09-05T06:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0003",
       "eventType": "illegal_parking",
-      "fusionHash": "451f6629f427cfa1",
+      "fusionHash": "eed822fe17b44785",
       "groundedRecommendationCoverage": 0,
       "grounding": {
         "caseCount": 0,
@@ -529,13 +529,13 @@
       ]
     },
     {
-      "agentOutputHash": "8f3c283c946f1cca",
+      "agentOutputHash": "be9adb6d8bfea161",
       "agentRunStatus": "completed",
       "brokenEvidenceRefCount": 0,
       "createdAt": "2026-09-05T06:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0003",
       "eventType": "illegal_parking",
-      "fusionHash": "5bdb67747bdd9f55",
+      "fusionHash": "ea1690499e2f7142",
       "groundedRecommendationCoverage": 2,
       "grounding": {
         "caseCount": 1,
@@ -586,7 +586,7 @@
       "createdAt": "2026-09-05T06:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0003",
       "eventType": "illegal_parking",
-      "fusionHash": "18f45c984067683b",
+      "fusionHash": "3e84cd938f83dc23",
       "groundedRecommendationCoverage": 2,
       "grounding": {
         "caseCount": 0,
@@ -634,7 +634,7 @@
       "createdAt": "2026-09-05T06:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0003",
       "eventType": "illegal_parking",
-      "fusionHash": "70adeeae552aebab",
+      "fusionHash": "b19c665c2748cccc",
       "groundedRecommendationCoverage": 2,
       "grounding": {
         "caseCount": 0,
@@ -684,7 +684,7 @@
       "createdAt": "2026-09-05T12:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0004",
       "eventType": "signal_fault",
-      "fusionHash": "30b19fbe0b971e0c",
+      "fusionHash": "5694202ea60d849f",
       "groundedRecommendationCoverage": 0,
       "grounding": {
         "caseCount": 0,
@@ -726,13 +726,13 @@
       ]
     },
     {
-      "agentOutputHash": "0b393e07d3a7b75e",
+      "agentOutputHash": "2aa0dc4e946d93c3",
       "agentRunStatus": "completed",
       "brokenEvidenceRefCount": 0,
       "createdAt": "2026-09-05T12:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0004",
       "eventType": "signal_fault",
-      "fusionHash": "7a3537549cbbe274",
+      "fusionHash": "f9633e4091d2de97",
       "groundedRecommendationCoverage": 3,
       "grounding": {
         "caseCount": 1,
@@ -784,7 +784,7 @@
       "createdAt": "2026-09-05T12:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0004",
       "eventType": "signal_fault",
-      "fusionHash": "5360a448ca8d6e29",
+      "fusionHash": "76317dede676fa5d",
       "groundedRecommendationCoverage": 3,
       "grounding": {
         "caseCount": 0,
@@ -833,7 +833,7 @@
       "createdAt": "2026-09-05T12:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0004",
       "eventType": "signal_fault",
-      "fusionHash": "e0722b97fe6952c9",
+      "fusionHash": "9fbf33492b60e6c1",
       "groundedRecommendationCoverage": 3,
       "grounding": {
         "caseCount": 0,
@@ -884,7 +884,7 @@
       "createdAt": "2026-09-06T00:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0005",
       "eventType": "pedestrian_intrusion",
-      "fusionHash": "90c3595fa2c88c14",
+      "fusionHash": "222b201f18338740",
       "groundedRecommendationCoverage": 0,
       "grounding": {
         "caseCount": 0,
@@ -926,13 +926,13 @@
       ]
     },
     {
-      "agentOutputHash": "19bdb765f0a2435a",
+      "agentOutputHash": "dc29c3356c51af7b",
       "agentRunStatus": "completed",
       "brokenEvidenceRefCount": 0,
       "createdAt": "2026-09-06T00:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0005",
       "eventType": "pedestrian_intrusion",
-      "fusionHash": "5d0236585100480e",
+      "fusionHash": "5356027b892019c1",
       "groundedRecommendationCoverage": 3,
       "grounding": {
         "caseCount": 2,
@@ -984,7 +984,7 @@
       "createdAt": "2026-09-06T00:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0005",
       "eventType": "pedestrian_intrusion",
-      "fusionHash": "101c9424710ac21d",
+      "fusionHash": "f78873b6f827b07b",
       "groundedRecommendationCoverage": 3,
       "grounding": {
         "caseCount": 0,
@@ -1033,7 +1033,7 @@
       "createdAt": "2026-09-06T00:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0005",
       "eventType": "pedestrian_intrusion",
-      "fusionHash": "b2b46eb26f609c80",
+      "fusionHash": "1de29e037e24c0ee",
       "groundedRecommendationCoverage": 3,
       "grounding": {
         "caseCount": 0,
@@ -1084,7 +1084,7 @@
       "createdAt": "2026-09-06T12:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0006",
       "eventType": "vehicle_stopped",
-      "fusionHash": "7216307739e3f385",
+      "fusionHash": "3bf41dab83a6d1d7",
       "groundedRecommendationCoverage": 0,
       "grounding": {
         "caseCount": 0,
@@ -1126,13 +1126,13 @@
       ]
     },
     {
-      "agentOutputHash": "bdbe59b8b495a507",
+      "agentOutputHash": "5f48ef298b81e596",
       "agentRunStatus": "completed",
       "brokenEvidenceRefCount": 0,
       "createdAt": "2026-09-06T12:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0006",
       "eventType": "vehicle_stopped",
-      "fusionHash": "5cb68f3fa20dc063",
+      "fusionHash": "dfaf2a0d5a0c9715",
       "groundedRecommendationCoverage": 2,
       "grounding": {
         "caseCount": 1,
@@ -1184,7 +1184,7 @@
       "createdAt": "2026-09-06T12:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0006",
       "eventType": "vehicle_stopped",
-      "fusionHash": "683f525a67935aa3",
+      "fusionHash": "c695b6f5109c86d9",
       "groundedRecommendationCoverage": 2,
       "grounding": {
         "caseCount": 0,
@@ -1233,7 +1233,7 @@
       "createdAt": "2026-09-06T12:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0006",
       "eventType": "vehicle_stopped",
-      "fusionHash": "1a4f8bb323b3a7bd",
+      "fusionHash": "8e1d439e064f7edf",
       "groundedRecommendationCoverage": 2,
       "grounding": {
         "caseCount": 0,
@@ -1284,7 +1284,7 @@
       "createdAt": "2026-09-07T00:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0007",
       "eventType": "congestion",
-      "fusionHash": "f54c047c1781b56a",
+      "fusionHash": "9cf08781ad702eb2",
       "groundedRecommendationCoverage": 0,
       "grounding": {
         "caseCount": 0,
@@ -1325,13 +1325,13 @@
       ]
     },
     {
-      "agentOutputHash": "9bff2648a986b840",
+      "agentOutputHash": "087427fed409d3b0",
       "agentRunStatus": "completed",
       "brokenEvidenceRefCount": 0,
       "createdAt": "2026-09-07T00:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0007",
       "eventType": "congestion",
-      "fusionHash": "c6e06fe2bafc14c0",
+      "fusionHash": "858f25cf5d88e0bd",
       "groundedRecommendationCoverage": 2,
       "grounding": {
         "caseCount": 1,
@@ -1382,7 +1382,7 @@
       "createdAt": "2026-09-07T00:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0007",
       "eventType": "congestion",
-      "fusionHash": "882e80b3823a1ed2",
+      "fusionHash": "b0f418f5ffc12e7c",
       "groundedRecommendationCoverage": 2,
       "grounding": {
         "caseCount": 0,
@@ -1430,7 +1430,7 @@
       "createdAt": "2026-09-07T00:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0007",
       "eventType": "congestion",
-      "fusionHash": "acf758153f54af70",
+      "fusionHash": "3bfdffc4cf4138a3",
       "groundedRecommendationCoverage": 2,
       "grounding": {
         "caseCount": 0,
@@ -1480,7 +1480,7 @@
       "createdAt": "2026-09-07T12:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0008",
       "eventType": "accident",
-      "fusionHash": "27b0b838fa7de261",
+      "fusionHash": "e4834c0db7e14346",
       "groundedRecommendationCoverage": 0,
       "grounding": {
         "caseCount": 0,
@@ -1522,13 +1522,13 @@
       ]
     },
     {
-      "agentOutputHash": "af22376e19468edb",
+      "agentOutputHash": "1e4ae65971c55797",
       "agentRunStatus": "completed",
       "brokenEvidenceRefCount": 0,
       "createdAt": "2026-09-07T12:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0008",
       "eventType": "accident",
-      "fusionHash": "68ae2fc08f486de5",
+      "fusionHash": "37a9e347c6d889b1",
       "groundedRecommendationCoverage": 3,
       "grounding": {
         "caseCount": 2,
@@ -1580,7 +1580,7 @@
       "createdAt": "2026-09-07T12:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0008",
       "eventType": "accident",
-      "fusionHash": "10036343c7d67d35",
+      "fusionHash": "76915bab04e2864b",
       "groundedRecommendationCoverage": 3,
       "grounding": {
         "caseCount": 0,
@@ -1629,7 +1629,7 @@
       "createdAt": "2026-09-07T12:30:00Z",
       "eventId": "SYN_QT_HOLDOUT_0008",
       "eventType": "accident",
-      "fusionHash": "a60f44f3f8cc5afd",
+      "fusionHash": "73d4f4be344c221a",
       "groundedRecommendationCoverage": 3,
       "grounding": {
         "caseCount": 0,

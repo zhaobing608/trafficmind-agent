@@ -121,7 +121,18 @@ class ToolRegistry:
         ))
         self.register(ToolMetadata(
             name="update_event_status", category="persistence", description="更新事件处置状态",
-            sideEffect=True, riskLevel=ToolRisk.WRITE,
+            sideEffect=True, riskLevel=ToolRisk.WRITE, idempotent=True,
+        ))
+        self.register(ToolMetadata(
+            name="create_dispatch_task", category="dispatch", description="创建内部处置派单任务",
+            sideEffect=True, riskLevel=ToolRisk.HIGH_RISK, approvalRequired=True,
+            idempotent=True,
+        ))
+        self.register(ToolMetadata(
+            name="send_notification", category="notification", description="通过服务端通知 Provider 发送消息",
+            sideEffect=True, riskLevel=ToolRisk.HIGH_RISK, approvalRequired=True,
+            idempotent=True, timeoutSeconds=15.0,
+            retryPolicy={"maxRetries": 0},
         ))
 
         # ── 外部通知（HIGH_RISK，有外部副作用） ──
@@ -193,10 +204,6 @@ class ToolRegistry:
         ))
 
         # ── 其他业务写操作（WRITE） ──
-        self.register(ToolMetadata(
-            name="update_event_status", category="persistence", description="更新事件处置状态",
-            sideEffect=True, riskLevel=ToolRisk.WRITE,
-        ))
         self.register(ToolMetadata(
             name="build_knowledge_index", category="knowledge", description="重建知识库向量索引",
             sideEffect=True, riskLevel=ToolRisk.WRITE,

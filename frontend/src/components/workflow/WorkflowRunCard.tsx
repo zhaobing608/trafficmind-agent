@@ -80,6 +80,7 @@ export const WorkflowRunCard: React.FC<Props> = ({ run, onClick }) => {
   } else {
     const parts2 = [`动作 ${a.succeeded}/${a.total}`];
     if (a.failed > 0) parts2.push(`失败 ${a.failed}`);
+    if ((a.unknown || 0) > 0) parts2.push(`待确认 ${a.unknown}`);
     actionText = parts2.join(' · ');
   }
 

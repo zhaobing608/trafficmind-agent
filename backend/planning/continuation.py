@@ -50,7 +50,7 @@ from backend.planning.revision import (
     validate_carried_refs,
 )
 from backend.planning.validator import has_errors, validate_plan
-from backend.workflow.models import WorkflowEvent, WorkflowRun, WorkflowRunStatus, generate_event_id
+from backend.workflow.models import WorkflowRun, WorkflowRunStatus
 from backend.workflow.repository import SQLiteWorkflowRepository
 
 
@@ -86,16 +86,11 @@ class PlanningContinuationCoordinator:
 
     def persist_observation(self, observation: Observation) -> None:
         """写 observation_recorded workflow_event（durable audit log）。"""
-        events = self._repo.list_events(observation.runId)
-        seq = len(events)
-        evt = WorkflowEvent(
-            event_id=generate_event_id(observation.runId, seq),
-            run_id=observation.runId,
-            event_type="observation_recorded",
+        self._repo.append_event(
+            observation.runId,
+            "observation_recorded",
             payload=observation.to_dict(),
-            sequence=seq,
         )
-        self._repo.save_event(evt)
 
     # ── 幂等 / lineage 辅助 ─────────────────────────────────────────
 

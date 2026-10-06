@@ -79,16 +79,24 @@ class RecoverySafetyClassifier:
 
 
 def detect_unknown_outcome(repo, run_id: str) -> List[Dict[str, Any]]:
-    """检测 dispatch started 但无 durable terminal result 的高风险 action。
+    """检测 dispatch started 但无 durable terminal result 的 Action。
 
     返回 UNKNOWN_OUTCOME 候选列表（每个含 actionId/actionType/nodeId）。
     有 durable terminal result（SUCCEEDED/FAILED）→ 不返回（known outcome）。
+
+    Phase 21.3 executors that advertise reconciliation are fenced as UNKNOWN
+    regardless of risk class.  Even an idempotent internal write may have
+    committed before the process died; replay must first establish durable
+    truth instead of leaving its RUNNING marker stranded.
     """
     classifier = RecoverySafetyClassifier()
     unknowns: List[Dict[str, Any]] = []
     for record in repo.list_executing_action_records(run_id):
         cls = classifier.classify_node("action", record.action_type)
-        if cls == RecoverySafetyClass.HIGH_RISK_NON_IDEMPOTENT:
+        if (
+            record.reconciliation_supported
+            or cls == RecoverySafetyClass.HIGH_RISK_NON_IDEMPOTENT
+        ):
             unknowns.append({
                 "actionId": record.action_id,
                 "actionType": record.action_type,

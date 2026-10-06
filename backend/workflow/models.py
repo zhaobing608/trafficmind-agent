@@ -67,6 +67,7 @@ class NodeStatus(str, Enum):
     SKIPPED = "skipped"
     TIMED_OUT = "timed_out"
     AWAITING_APPROVAL = "awaiting_approval"
+    PAUSED = "paused"
 
 
 class ApprovalDecision(str, Enum):
@@ -77,12 +78,34 @@ class ApprovalDecision(str, Enum):
     EDITED = "edited"
 
 
+class ApprovalReasonCode(str, Enum):
+    """Operator-supplied structured reason; never inferred by an Agent."""
+
+    NONE = "NONE"
+    UNSUPPORTED_ACTION = "UNSUPPORTED_ACTION"
+    TOO_HIGH_RISK = "TOO_HIGH_RISK"
+    INCORRECT_CONTEXT = "INCORRECT_CONTEXT"
+    UNNECESSARY = "UNNECESSARY"
+    DUPLICATE = "DUPLICATE"
+    OPERATOR_JUDGMENT = "OPERATOR_JUDGMENT"
+    OTHER = "OTHER"
+
+
 class ActionStatus(str, Enum):
-    """外部动作执行状态。"""
+    """Durable action-execution status.
+
+    ``EXECUTING`` is retained for rows written before Phase 21.3.  New
+    executions use ``RUNNING`` and stale legacy EXECUTING rows are treated as
+    an unknown outcome rather than being dispatched again.
+    """
     PENDING = "pending"
+    RUNNING = "running"
     EXECUTING = "executing"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    UNKNOWN = "unknown"
+    CANCELLED = "cancelled"
+    BLOCKED = "blocked"
 
 
 class DefinitionStatus(str, Enum):
@@ -622,12 +645,15 @@ class WorkflowApproval:
     decision: ApprovalDecision = ApprovalDecision.PENDING
     reviewer: str = ""
     comment: str = ""
+    reason_code: ApprovalReasonCode = ApprovalReasonCode.NONE
     created_at: str = ""
     decided_at: str = ""
 
     def __post_init__(self):
         if not self.created_at:
             self.created_at = _utc_now_iso()
+        if isinstance(self.reason_code, str):
+            self.reason_code = ApprovalReasonCode(self.reason_code or "NONE")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -639,6 +665,7 @@ class WorkflowApproval:
             "decision": self.decision.value,
             "reviewer": self.reviewer,
             "comment": self.comment,
+            "reasonCode": self.reason_code.value,
             "createdAt": self.created_at,
             "decidedAt": self.decided_at,
         }
@@ -654,6 +681,7 @@ class WorkflowApproval:
             decision=ApprovalDecision(d.get("decision", "pending")),
             reviewer=d.get("reviewer", ""),
             comment=d.get("comment", ""),
+            reason_code=ApprovalReasonCode(d.get("reasonCode", "NONE") or "NONE"),
             created_at=d.get("createdAt", ""),
             decided_at=d.get("decidedAt", ""),
         )
@@ -668,7 +696,7 @@ class WorkflowApproval:
 class WorkflowActionRecord:
     """外部动作执行记录。
 
-    幂等键设计: workflowRunId:nodeId:actionType
+    幂等键设计: workflowRunId:nodeId:actionType:semanticActionVersion
     重复 resume 或 retry 不得重复执行已成功动作。
 
     Attributes:
@@ -676,7 +704,7 @@ class WorkflowActionRecord:
         run_id: 所属 Run ID
         node_id: 触发节点 ID
         action_type: 动作类型（如 "notify_wechat", "adjust_signal"）
-        idempotency_key: 幂等键（格式: {runId}:{nodeId}:{actionType}）
+        idempotency_key: 幂等键（格式含 run/node/action/semantic version）
         params: 动作参数
         result: 执行结果
         status: 执行状态
@@ -695,28 +723,67 @@ class WorkflowActionRecord:
     error: str = ""
     created_at: str = ""
     completed_at: str = ""
+    event_id: str = ""
+    semantic_action_version: str = "v1"
+    attempt: int = 0
+    started_at: str = ""
+    finished_at: str = ""
+    request_metadata: Dict[str, Any] = field(default_factory=dict)
+    external_reference: str = ""
+    last_reconciled_at: str = ""
+    unknown_since: str = ""
+    reconciliation_attempts: int = 0
+    reconciliation_supported: bool = False
+    retryable: bool = False
+    reconciliation_message: str = ""
 
     def __post_init__(self):
         if not self.created_at:
             self.created_at = _utc_now_iso()
         if not self.idempotency_key:
             self.idempotency_key = compute_action_idempotency_key(
-                self.run_id, self.node_id, self.action_type
+                self.run_id, self.node_id, self.action_type,
+                self.semantic_action_version,
             )
+        if not self.started_at and self.status in {
+            ActionStatus.RUNNING,
+            ActionStatus.EXECUTING,
+            ActionStatus.SUCCEEDED,
+            ActionStatus.FAILED,
+            ActionStatus.UNKNOWN,
+        }:
+            self.started_at = self.created_at
+        if not self.finished_at and self.completed_at:
+            self.finished_at = self.completed_at
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "actionId": self.action_id,
+            "actionExecutionId": self.action_id,
             "runId": self.run_id,
+            "workflowRunId": self.run_id,
             "nodeId": self.node_id,
+            "eventId": self.event_id,
             "actionType": self.action_type,
             "idempotencyKey": self.idempotency_key,
+            "semanticActionVersion": self.semantic_action_version,
+            "attempt": self.attempt,
             "params": self.params,
+            "requestMetadata": self.request_metadata,
             "result": self.result,
             "status": self.status.value,
             "error": self.error,
             "createdAt": self.created_at,
             "completedAt": self.completed_at,
+            "startedAt": self.started_at or self.created_at,
+            "finishedAt": self.finished_at or self.completed_at,
+            "externalReference": self.external_reference or None,
+            "lastReconciledAt": self.last_reconciled_at or None,
+            "unknownSince": self.unknown_since or None,
+            "reconciliationAttempts": int(self.reconciliation_attempts or 0),
+            "reconciliationSupported": self.reconciliation_supported,
+            "retryable": self.retryable,
+            "reconciliationMessage": self.reconciliation_message or None,
         }
 
     @classmethod
@@ -733,7 +800,52 @@ class WorkflowActionRecord:
             error=d.get("error", ""),
             created_at=d.get("createdAt", ""),
             completed_at=d.get("completedAt", ""),
+            event_id=d.get("eventId", ""),
+            semantic_action_version=d.get("semanticActionVersion", "v1"),
+            attempt=int(d.get("attempt", 0) or 0),
+            started_at=d.get("startedAt", ""),
+            finished_at=d.get("finishedAt", ""),
+            request_metadata=d.get("requestMetadata", {}),
+            external_reference=d.get("externalReference", "") or "",
+            last_reconciled_at=d.get("lastReconciledAt", "") or "",
+            unknown_since=d.get("unknownSince", "") or "",
+            reconciliation_attempts=int(d.get("reconciliationAttempts", 0) or 0),
+            reconciliation_supported=bool(d.get("reconciliationSupported", False)),
+            retryable=bool(d.get("retryable", False)),
+            reconciliation_message=d.get("reconciliationMessage", "") or "",
         )
+
+
+@dataclass
+class WorkflowActionAttempt:
+    """Immutable history for one execution or reconciliation-visible attempt."""
+
+    attempt_id: str
+    action_id: str
+    attempt: int
+    status: ActionStatus = ActionStatus.PENDING
+    started_at: str = ""
+    finished_at: str = ""
+    request_metadata: Dict[str, Any] = field(default_factory=dict)
+    external_reference: str = ""
+    result: Dict[str, Any] = field(default_factory=dict)
+    error: str = ""
+    last_reconciled_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "attemptId": self.attempt_id,
+            "actionExecutionId": self.action_id,
+            "attempt": self.attempt,
+            "status": self.status.value,
+            "startedAt": self.started_at or None,
+            "finishedAt": self.finished_at or None,
+            "requestMetadata": self.request_metadata,
+            "externalReference": self.external_reference or None,
+            "result": self.result,
+            "error": self.error or None,
+            "lastReconciledAt": self.last_reconciled_at or None,
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -763,11 +875,33 @@ def generate_action_id() -> str:
     return f"wfact_{uuid.uuid4().hex[:12]}"
 
 
-def compute_action_idempotency_key(run_id: str, node_id: str, action_type: str) -> str:
+def compute_action_idempotency_key(
+    run_id: str,
+    node_id: str,
+    action_type: str,
+    semantic_action_version: str = "v1",
+) -> str:
     """计算外部动作幂等键。
 
-    格式: {runId}:{nodeId}:{actionType} 的 SHA-256 前 16 位。
-    这确保同一 run 中同一节点的同一类型动作只执行一次。
+    格式: {runId}:{nodeId}:{actionType}:{semanticActionVersion} 的 SHA-256
+    前 16 位。这确保同一语义版本只执行一次，同时允许显式的新语义
+    版本形成新的副作用身份。
+    """
+    raw = f"{run_id}:{node_id}:{action_type}:{semantic_action_version or 'v1'}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def compute_legacy_action_idempotency_key(
+    run_id: str,
+    node_id: str,
+    action_type: str,
+) -> str:
+    """Return the pre-21.3 three-part action identity.
+
+    Existing databases can contain confirmed side effects keyed without a
+    semantic version.  The runtime must continue to recognise those rows
+    during an in-place upgrade so a crash/restart cannot dispatch them again.
+    New records always use :func:`compute_action_idempotency_key`.
     """
     raw = f"{run_id}:{node_id}:{action_type}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]

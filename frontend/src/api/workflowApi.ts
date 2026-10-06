@@ -1,6 +1,14 @@
 /** Workflow V1 + Workflow Center V2 API 客户端 */
 
-import type { RunListResponse, DecisionProvenanceEntry } from '../types/workflow';
+import type {
+  RunListResponse,
+  DecisionProvenanceEntry,
+  WorkflowApproval,
+  WorkflowActionRecord,
+  WorkflowRunStatus,
+  WorkflowRuntimeOperations,
+  WorkflowRuntimeProjection,
+} from '../types/workflow';
 
 const API = '/api';
 
@@ -11,13 +19,19 @@ export interface WorkflowDefinition {
 }
 
 export interface WorkflowRunDetail {
-  run: Record<string, unknown>;
+  run: Record<string, unknown> & {
+    runId: string; definitionId: string; status: WorkflowRunStatus;
+    currentNodeId: string; updatedAt: string;
+  };
   state: Record<string, unknown>;
   nodeRuns: Array<Record<string, unknown>>;
   events: Array<Record<string, unknown>>;
-  actionRecords: Array<Record<string, unknown>>;
+  actionRecords: WorkflowActionRecord[];
   nodeCount: number; eventCount: number;
   decisionProvenance?: DecisionProvenanceEntry[];
+  runtime: WorkflowRuntimeProjection;
+  operations: WorkflowRuntimeOperations;
+  approvals: WorkflowApproval[];
 }
 
 export interface WorkflowTrace {
@@ -25,7 +39,25 @@ export interface WorkflowTrace {
   status: string; currentNodeId: string;
   timeline: Array<Record<string, unknown>>;
   nodeRuns: Array<Record<string, unknown>>;
-  actionRecords: Array<Record<string, unknown>>;
+  actionRecords: WorkflowActionRecord[];
+  approvals?: WorkflowApproval[];
+}
+
+export interface ApprovalMutationResponse extends Record<string, unknown> {
+  runId: string;
+  approvalId: string;
+  status: WorkflowRunStatus;
+  continuationScheduled: boolean;
+}
+
+async function responseError(response: Response, fallback: string): Promise<Error> {
+  const body = await response.json().catch(() => null) as {
+    detail?: string | { message?: string; code?: string };
+  } | null;
+  const detail = body?.detail;
+  const message = typeof detail === 'string' ? detail : detail?.message;
+  const code = typeof detail === 'object' ? detail?.code : undefined;
+  return new Error(`${message || fallback}${code ? ` (${code})` : ''}`);
 }
 
 /** 列出 Definition */
@@ -101,9 +133,13 @@ export async function getRunTrace(runId: string): Promise<WorkflowTrace> {
 }
 
 /** 取消 Run */
-export async function cancelRun(runId: string): Promise<Record<string, unknown>> {
-  const resp = await fetch(`${API}/workflow/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' });
-  if (!resp.ok) throw new Error(`Failed to cancel: ${resp.status}`);
+export async function cancelRun(runId: string, reason = ''): Promise<Record<string, unknown>> {
+  const resp = await fetch(`${API}/workflow/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason }),
+  });
+  if (!resp.ok) throw await responseError(resp, `Failed to cancel: ${resp.status}`);
   return resp.json();
 }
 
@@ -114,7 +150,33 @@ export async function retryNode(runId: string, nodeId: string): Promise<Record<s
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ nodeId }),
   });
-  if (!resp.ok) throw new Error(`Failed to retry: ${resp.status}`);
+  if (!resp.ok) throw await responseError(resp, `Failed to retry: ${resp.status}`);
+  return resp.json();
+}
+
+/** Retry is allowed only after the provider/executor confirmed no side effect. */
+export async function retryAction(
+  runId: string,
+  actionExecutionId: string,
+): Promise<Record<string, unknown>> {
+  const resp = await fetch(
+    `${API}/workflow/runs/${encodeURIComponent(runId)}/actions/${encodeURIComponent(actionExecutionId)}/retry`,
+    { method: 'POST' },
+  );
+  if (!resp.ok) throw await responseError(resp, `Failed to retry action: ${resp.status}`);
+  return resp.json();
+}
+
+/** Query external truth for UNKNOWN; this endpoint never repeats execute. */
+export async function reconcileAction(
+  runId: string,
+  actionExecutionId: string,
+): Promise<Record<string, unknown>> {
+  const resp = await fetch(
+    `${API}/workflow/runs/${encodeURIComponent(runId)}/actions/${encodeURIComponent(actionExecutionId)}/reconcile`,
+    { method: 'POST' },
+  );
+  if (!resp.ok) throw await responseError(resp, `Failed to reconcile action: ${resp.status}`);
   return resp.json();
 }
 
@@ -126,7 +188,7 @@ export async function processApproval(
     reviewer?: string; comment?: string;
     editedActions?: Array<Record<string, unknown>>;
   },
-): Promise<Record<string, unknown>> {
+): Promise<ApprovalMutationResponse> {
   const resp = await fetch(
     `${API}/workflow/runs/${encodeURIComponent(runId)}/approvals/${encodeURIComponent(approvalId)}`,
     {
@@ -136,8 +198,7 @@ export async function processApproval(
     },
   );
   if (!resp.ok) {
-    const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-    throw new Error((err as { detail?: string }).detail || `Approval failed: ${resp.status}`);
+    throw await responseError(resp, `Approval failed: ${resp.status}`);
   }
   return resp.json();
 }
@@ -181,7 +242,7 @@ export async function listRuns(params?: {
 }
 
 /** 通用 SSE 消费器 */
-async function consumeWorkflowSSE(
+export async function consumeWorkflowSSE(
   response: Response,
   callbacks: {
     onEvent: (eventType: string, data: Record<string, unknown>) => void;
@@ -192,18 +253,25 @@ async function consumeWorkflowSSE(
   if (!response.ok) {
     const text = await response.text().catch(() => '');
     callbacks.onError?.(`HTTP ${response.status}: ${text}`);
+    // A transport-level HTTP failure is also a non-terminal stream ending.
+    // Give callers the same recovery signal used for an unexpected EOF.
+    callbacks.onDone?.('interrupted');
     return;
   }
 
   const reader = response.body?.getReader();
   if (!reader) {
     callbacks.onError?.('Response body is not readable');
+    callbacks.onDone?.('interrupted');
     return;
   }
 
   const decoder = new TextDecoder();
   let buffer = '';
   let streamDone = false;
+  // SSE event/data lines may arrive in different network chunks.  Keep the
+  // event name across reads instead of resetting it for every chunk.
+  let currentEvent = '';
 
   try {
     while (!streamDone) {
@@ -214,7 +282,6 @@ async function consumeWorkflowSSE(
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
-      let currentEvent = '';
       for (const line of lines) {
         if (line.startsWith('event: ')) {
           currentEvent = line.slice(7).trim();
@@ -224,15 +291,21 @@ async function consumeWorkflowSSE(
             const data = JSON.parse(dataStr);
             if (currentEvent === 'done') {
               streamDone = true;
-              callbacks.onDone?.(data.status || 'completed');
+              callbacks.onDone?.(
+                typeof data.status === 'string' && data.status
+                  ? data.status
+                  : 'interrupted',
+              );
             } else if (currentEvent === 'error') {
               callbacks.onError?.(data.message || 'Unknown error');
             } else {
               callbacks.onEvent(currentEvent || 'message', data);
             }
+            currentEvent = '';
           } catch {
             // skip unparseable lines
           }
+          if (streamDone) break;
         }
       }
     }

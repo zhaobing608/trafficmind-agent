@@ -40,14 +40,18 @@ VALID_TRANSITIONS: Dict[WorkflowRunStatus, set] = {
         WorkflowRunStatus.FAILED,
     },
     WorkflowRunStatus.AWAITING_APPROVAL: {
+        WorkflowRunStatus.PENDING,
         WorkflowRunStatus.RUNNING,
         WorkflowRunStatus.COMPLETED,
         WorkflowRunStatus.REJECTED,
         WorkflowRunStatus.CANCELLED,
     },
     WorkflowRunStatus.COMPLETED: set(),   # 终止状态，不可转换
-    WorkflowRunStatus.FAILED: set(),       # 终止状态，不可转换
+    # FAILED is terminal for automatic execution, but an explicit validated
+    # retry may create a new durable attempt from the failed cursor.
+    WorkflowRunStatus.FAILED: {WorkflowRunStatus.PENDING},
     WorkflowRunStatus.CANCELLED: set(),    # 终止状态，不可转换
+    WorkflowRunStatus.REJECTED: set(),     # 终止状态，不可转换
 }
 
 
@@ -113,7 +117,11 @@ class TrafficWorkflowState:
     current_node: str = ""
     status: WorkflowRunStatus = WorkflowRunStatus.PENDING
     attempt_counts: Dict[str, int] = field(default_factory=dict)
+    completed_steps: List[str] = field(default_factory=list)
+    retry_count: int = 0
     pending_approval: Optional[Dict[str, Any]] = None
+    cancel_reason: str = ""
+    cancelled_at: str = ""
 
     # ── 追踪 ──────────────────────────────────────────────────────────────
     errors: List[Dict[str, Any]] = field(default_factory=list)
@@ -135,6 +143,7 @@ class TrafficWorkflowState:
     # ── 时间戳 ────────────────────────────────────────────────────────────
     started_at: str = ""
     updated_at: str = ""
+    finished_at: str = ""
 
     def __post_init__(self):
         if not self.updated_at:
@@ -154,6 +163,15 @@ class TrafficWorkflowState:
         self.updated_at = _utc_now_iso()
         if new_status == WorkflowRunStatus.RUNNING and not self.started_at:
             self.started_at = self.updated_at
+        if new_status in {
+            WorkflowRunStatus.COMPLETED,
+            WorkflowRunStatus.FAILED,
+            WorkflowRunStatus.CANCELLED,
+            WorkflowRunStatus.REJECTED,
+        }:
+            self.finished_at = self.updated_at
+        elif new_status == WorkflowRunStatus.PENDING:
+            self.finished_at = ""
 
     def is_terminal(self) -> bool:
         """是否为终止状态。"""
@@ -256,7 +274,11 @@ class TrafficWorkflowState:
             "currentNode": self.current_node,
             "status": self.status.value,
             "attemptCounts": self.attempt_counts,
+            "completedSteps": self.completed_steps,
+            "retryCount": self.retry_count,
             "pendingApproval": self.pending_approval,
+            "cancelReason": self.cancel_reason,
+            "cancelledAt": self.cancelled_at,
             "errors": self.errors,
             "auditEvents": self.audit_events,
             "simulationRefs": self.simulation_refs,
@@ -266,6 +288,7 @@ class TrafficWorkflowState:
             "actionRecordIds": self.action_record_ids,
             "startedAt": self.started_at,
             "updatedAt": self.updated_at,
+            "finishedAt": self.finished_at,
         }
 
     @classmethod
@@ -299,7 +322,11 @@ class TrafficWorkflowState:
             current_node=d.get("currentNode", ""),
             status=status,
             attempt_counts=d.get("attemptCounts", {}),
+            completed_steps=d.get("completedSteps", []),
+            retry_count=int(d.get("retryCount", 0) or 0),
             pending_approval=d.get("pendingApproval"),
+            cancel_reason=d.get("cancelReason", ""),
+            cancelled_at=d.get("cancelledAt", ""),
             errors=d.get("errors", []),
             audit_events=d.get("auditEvents", []),
             simulation_refs=d.get("simulationRefs", {}),
@@ -309,6 +336,7 @@ class TrafficWorkflowState:
             action_record_ids=d.get("actionRecordIds", []),
             started_at=d.get("startedAt", ""),
             updated_at=d.get("updatedAt", ""),
+            finished_at=d.get("finishedAt", ""),
         )
 
 

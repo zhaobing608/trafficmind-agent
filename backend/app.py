@@ -97,6 +97,9 @@ async def lifespan(app: FastAPI):
     # Phase 21: Traffic Case Memory tables (idempotent)
     from backend.case_memory.repository import init_case_memory_tables
     init_case_memory_tables()
+    # Phase 21.4: Runtime operations / durable operational alerts
+    from backend.observability.operations import init_operations_tables
+    init_operations_tables()
     # Phase 13 Round 2: Seed simulation_bridge template
     seed_workflow_templates()
     # Phase 12: Wait Scheduler
@@ -107,11 +110,15 @@ async def lifespan(app: FastAPI):
     from backend.workflow.run_driver import get_run_driver
     run_driver = get_run_driver()
     await run_driver.start()
+    from backend.observability.operations import get_operations_monitor
+    operations_monitor = get_operations_monitor()
+    await operations_monitor.start()
     llm_status = "已启用 (DeepSeek)" if LLM_ENABLED else "未配置，将使用本地模板"
     print(f"TrafficMind Agent 启动完成")
     print(f"  LLM 状态: {llm_status}")
     print(f"  API 文档: http://localhost:8000/docs")
     yield
+    await operations_monitor.stop()
     await run_driver.stop()
     await wait_scheduler.stop()
 
@@ -238,6 +245,45 @@ class EventImportRequest(BaseModel):
     events: List[Dict[str, Any]]
 
 
+class EventIngestRequest(BaseModel):
+    """Canonical single-event ingestion request."""
+    source: str
+    sourceEventId: str
+    event: Dict[str, Any]
+    occurredAt: Optional[str] = ""
+    sourceMetadata: Optional[Dict[str, Any]] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class EventReplayRequest(BaseModel):
+    """Safe replay request.  Replay never grants action execution authority."""
+    sessionId: Optional[str] = None
+    content: Optional[str] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+@app.post("/events/ingest", summary="接入一个 canonical 交通事件")
+async def ingest_canonical_event(body: EventIngestRequest):
+    from backend.event_ingestion import EventIngestionError, ingest_event
+
+    try:
+        return ingest_event(
+            source=body.source,
+            source_event_id=body.sourceEventId,
+            event=body.event,
+            occurred_at=body.occurredAt or "",
+            source_metadata=body.sourceMetadata,
+        )
+    except EventIngestionError as err:
+        status_code = 409 if err.code == "ingestion_conflict" else 400
+        raise HTTPException(
+            status_code=status_code,
+            detail={"code": err.code, "message": err.message},
+        )
+
+
 @app.post("/events/import", summary="批量导入真实交通事件（确定性管线）")
 async def import_events(body: EventImportRequest):
     """
@@ -333,6 +379,32 @@ async def get_event(event_id: str):
     if record is None:
         raise HTTPException(status_code=404, detail=f"事件 {event_id} 不存在")
     return record
+
+
+@app.get("/events/{event_id}", summary="查询 canonical 事件及真实关系链")
+async def get_canonical_event(event_id: str):
+    from backend.event_ingestion import project_event_relationships
+
+    record = get_event_by_id(event_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"事件 {event_id} 不存在")
+    return {
+        "event": record,
+        "relationships": project_event_relationships(event_id),
+    }
+
+
+@app.get("/events/{event_id}/status", summary="查询 canonical 事件状态")
+async def get_canonical_event_status(event_id: str):
+    record = get_event_by_id(event_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"事件 {event_id} 不存在")
+    return {
+        "eventId": event_id,
+        "status": record.get("status", ""),
+        "revision": record.get("revision", 1),
+        "updatedAt": record.get("updatedAt", ""),
+    }
 
 
 @app.post("/event/{event_id}/status", summary="更新事件状态")
@@ -1066,8 +1138,69 @@ async def routed_analyze_stream(body: RoutedStreamRequest):
     """
     authoritative_event = _prepare_event_bound_stream(body)
     if COLLABORATION_ORCHESTRATOR_ENABLED:
-        return await _orchestrated_analyze_stream(body, authoritative_event=authoritative_event)
-    return await _legacy_analyze_stream(body, authoritative_event=authoritative_event)
+        return await _orchestrated_analyze_stream(
+            body,
+            authoritative_event=authoritative_event,
+            runtime_metadata={"runKind": "live", "actionExecutionAllowed": True},
+        )
+    return await _legacy_analyze_stream(
+        body,
+        authoritative_event=authoritative_event,
+        runtime_metadata={"runKind": "live", "actionExecutionAllowed": True},
+    )
+
+
+@app.post("/events/{event_id}/replay", summary="安全重放历史事件到 Agent 分析")
+async def replay_canonical_event(event_id: str, body: EventReplayRequest = None):
+    """Start a separately identified Agent replay for an existing event.
+
+    Replay keeps the original ``eventId`` for lineage, creates a new Agent run,
+    does not advance the event lifecycle, and carries an explicit
+    ``actionExecutionAllowed=false`` marker into the persisted run.
+    """
+    try:
+        snapshot = hydrate_authoritative_event(event_id)
+    except EventIdentityError as err:
+        raise _event_identity_http_error(err)
+
+    request = body or EventReplayRequest()
+    replay_id = f"replay_{uuid.uuid4().hex[:16]}"
+    event_ctx = compact_event_context(snapshot)
+    replay_body = RoutedStreamRequest(
+        sessionId=request.sessionId,
+        content=request.content or f"重放事件 {event_id}，仅重新研判，不执行外部动作",
+        eventId=event_id,
+        eventType=event_ctx.get("eventType") or "congestion",
+        roadName=event_ctx.get("roadName") or "未知路段",
+        direction=event_ctx.get("direction") or "",
+        avgSpeed=event_ctx.get("avgSpeed"),
+        queueLength=event_ctx.get("queueLength"),
+        duration=event_ctx.get("duration"),
+        weather=event_ctx.get("weather") or "clear",
+        timePeriod=event_ctx.get("timePeriod") or "off_peak",
+        isMainRoad=bool(event_ctx.get("isMainRoad")),
+        nearbySchool=bool(event_ctx.get("nearbySchool")),
+        nearbyHospital=bool(event_ctx.get("nearbyHospital")),
+        contextPolicy="fresh_event",
+        runKind="replay",
+        replayId=replay_id,
+        replayOfEventId=event_id,
+        actionExecutionAllowed=False,
+    )
+    # Replay always uses the durable orchestrator path so every replay has its
+    # own persisted Agent run identity even when legacy live analysis is enabled.
+    response = await _orchestrated_analyze_stream(
+        replay_body,
+        authoritative_event=snapshot,
+        runtime_metadata={
+            "runKind": "replay",
+            "replayId": replay_id,
+            "replayOfEventId": event_id,
+            "actionExecutionAllowed": False,
+        },
+    )
+    response.headers["X-TrafficMind-Replay-Id"] = replay_id
+    return response
 
 
 async def _run_memory_extraction(
@@ -1200,6 +1333,7 @@ async def _run_memory_extraction(
 async def _orchestrated_analyze_stream(
     body: RoutedStreamRequest,
     authoritative_event: Optional[Dict[str, Any]] = None,
+    runtime_metadata: Optional[Dict[str, Any]] = None,
 ):
     """使用 CollaborationOrchestrator 执行协同分析。"""
     import asyncio as _asyncio
@@ -1237,6 +1371,21 @@ async def _orchestrated_analyze_stream(
             current_event["snapshotSource"] = "event_records"
             current_event["capturedAt"] = authoritative_event.get("capturedAt", "")
             current_event["fieldSources"] = field_sources
+        # Phase 21 replay metadata is server-owned and persisted with the Agent
+        # run.  It is intentionally separate from the canonical event row.
+        # Runtime safety metadata is server-owned.  RoutedStreamRequest keeps
+        # ``extra=allow`` for backwards-compatible traffic fields, but public
+        # callers cannot turn a live request into a replay (or re-enable a
+        # replay action) by smuggling undeclared JSON keys.
+        owned_metadata = dict(runtime_metadata or {})
+        run_kind = "replay" if owned_metadata.get("runKind") == "replay" else "live"
+        current_event["runKind"] = run_kind
+        current_event["actionExecutionAllowed"] = run_kind != "replay"
+        if run_kind == "replay":
+            current_event["replayId"] = str(owned_metadata.get("replayId") or "")
+            current_event["replayOfEventId"] = str(
+                owned_metadata.get("replayOfEventId") or extract_event_id(current_event)
+            )
 
         # ===== Step 3: Load previous run context — SEPARATE object =====
         sid = body.sessionId
@@ -1253,12 +1402,21 @@ async def _orchestrated_analyze_stream(
         raw["contextPolicy"] = context_policy
         raw["fieldSources"] = field_sources
         info = _get_event_info(raw)
+        for key in ("runKind", "replayId", "replayOfEventId", "actionExecutionAllowed"):
+            if key in current_event:
+                info[key] = current_event[key]
         info["fieldSources"] = field_sources
         info["contextPolicy"] = context_policy
         info["originalInput"] = content_text or ""
 
-        run_id = f"run_{int(datetime.now().timestamp() * 1000)}"
+        run_id = f"run_{int(datetime.now().timestamp() * 1000)}_{uuid.uuid4().hex[:8]}"
         trace_id = f"trace_{run_id}"
+        if info.get("runKind") == "replay":
+            yield sse_event("replay_started", {
+                "replayId": info.get("replayId", ""),
+                "eventId": info.get("replayOfEventId") or info.get("eventId", ""),
+                "actionExecutionAllowed": False,
+            })
         grounding_context = {}
         if authoritative_event:
             try:
@@ -1407,17 +1565,21 @@ async def _orchestrated_analyze_stream(
                 elif 'event: run_failed' in event_str:
                     run_status = "failed"
                 yield event_str
-            # Orchestrator handles its own done event — wrapper does NOT send duplicate
+            # The orchestrator emits a terminal run_* event.  The HTTP wrapper
+            # emits the transport-level ``done`` event after memory persistence.
         except Exception as e:
             # Non-retryable: don't silently fallback
             if any(kw in str(e) for kw in ["ValidationError", "缺少", "未注册", "非法"]):
                 run_status = "failed"
                 yield sse_event("run_failed", {"runId": run_id, "reason": str(e)[:200], "errorCode": "agent_not_registered"})
+                yield sse_event("done", {"runId": run_id, "sessionId": sid, "status": "failed"})
                 return
             # System error: degraded fallback
             degraded = True; fallback_reason = str(e)
             yield sse_event("fallback_started", {"reason": fallback_reason, "fallbackFrom": "orchestrator"})
-            async for ev in _legacy_analyze_stream_inner(body, sid, authoritative_event):
+            async for ev in _legacy_analyze_stream_inner(
+                body, sid, authoritative_event, runtime_metadata=owned_metadata
+            ):
                 yield ev
         finally:
             # Guard: ensure collaboration_runs.status is never left in "running" if we crash
@@ -1430,10 +1592,13 @@ async def _orchestrated_analyze_stream(
                         run_data["status"] = "failed"
                         run_data["updated_at"] = datetime.now().isoformat()
                         repo.update_run(run_data)
+                    run_status = "failed"
                 except Exception:
                     pass
 
         # Save assistant message with REAL fusion summary (not placeholder)
+        # The CollaborationRepository commits terminal Agent truth and the
+        # canonical 待研判→待派单 transition in one SQLite transaction.
         assistant_content = fusion_summary or "协同分析已完成，请查看运行详情获取融合决策。"
         am_id = f"am_{int(datetime.now().timestamp() * 1000)}"
         add_message(am_id, sid, "assistant", assistant_content, "collaboration",
@@ -1468,6 +1633,15 @@ async def _orchestrated_analyze_stream(
                     "latencyMs": _mem_result["latencyMs"],
                 })
 
+        if not degraded:
+            yield sse_event("done", {
+                "runId": run_id,
+                "sessionId": sid,
+                "status": run_status,
+                "runKind": info.get("runKind", "live"),
+                "replayId": info.get("replayId", ""),
+            })
+
     return StreamingResponse(agent_stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -1475,11 +1649,17 @@ async def _orchestrated_analyze_stream(
 async def _legacy_analyze_stream(
     body: RoutedStreamRequest,
     authoritative_event: Optional[Dict[str, Any]] = None,
+    runtime_metadata: Optional[Dict[str, Any]] = None,
 ):
     """旧协同分析实现。"""
     import asyncio as _asyncio
     async def agent_stream():
-        async for ev in _legacy_analyze_stream_inner(body, body.sessionId, authoritative_event):
+        async for ev in _legacy_analyze_stream_inner(
+            body,
+            body.sessionId,
+            authoritative_event,
+            runtime_metadata=runtime_metadata,
+        ):
             yield ev
     return StreamingResponse(agent_stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1489,6 +1669,7 @@ async def _legacy_analyze_stream_inner(
     body: RoutedStreamRequest,
     sid: str,
     authoritative_event: Optional[Dict[str, Any]] = None,
+    runtime_metadata: Optional[Dict[str, Any]] = None,
 ):
     import asyncio as _asyncio
     if not sid:
@@ -1503,6 +1684,22 @@ async def _legacy_analyze_stream_inner(
 
     info_source = compact_event_context(authoritative_event) if authoritative_event else body.model_dump()
     info = _get_event_info(info_source)
+    owned_metadata = dict(runtime_metadata or {})
+    run_kind = "replay" if owned_metadata.get("runKind") == "replay" else "live"
+    info["runKind"] = run_kind
+    info["actionExecutionAllowed"] = run_kind != "replay"
+    info.pop("replayId", None)
+    info.pop("replayOfEventId", None)
+    if run_kind == "replay":
+        info["replayId"] = str(owned_metadata.get("replayId") or "")
+        info["replayOfEventId"] = str(
+            owned_metadata.get("replayOfEventId") or extract_event_id(info)
+        )
+        yield sse_event("replay_started", {
+            "replayId": info["replayId"],
+            "eventId": info["replayOfEventId"],
+            "actionExecutionAllowed": False,
+        })
     routing = route_agents(info)
     agents_order = [a for a in routing["selectedAgents"] if a != "ReportAgent"]
 
@@ -1540,6 +1737,11 @@ async def _legacy_analyze_stream_inner(
     am_id = f"am_{int(datetime.now().timestamp() * 1000)}"
     add_message(am_id, sid, "assistant", fusion, "collaboration",
                 {"selectedAgents": routing["selectedAgents"], "conflictCount": len(conflicts)})
+    if authoritative_event and run_kind != "replay":
+        from backend.tools.db_tools import advance_event_status
+        advance_event_status(
+            extract_event_id(authoritative_event), "待派单", allowed_from=["待研判"]
+        )
     yield sse_event("done", {"sessionId": sid, "assistantMessageId": am_id, "title": title[:20], "agentResults": all_results, "fusionSummary": fusion})
 
 
@@ -1822,8 +2024,14 @@ app.include_router(simulation_router)
 # Phase 14: Workflow Observability V1 Router
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from backend.observability.api import router as observability_router
+from backend.observability.api import (
+    router as observability_router,
+    operations_router,
+    event_trace_router,
+)
 app.include_router(observability_router)
+app.include_router(operations_router)
+app.include_router(event_trace_router)
 
 # Phase 14 Round 3: Evaluation Dashboard
 from backend.evaluation.eval_api import router as eval_router
@@ -1834,8 +2042,9 @@ from backend.regional.api import router as regional_router
 app.include_router(regional_router)
 
 # Phase 21: Traffic Case Memory
-from backend.case_memory.api import router as case_memory_router
+from backend.case_memory.api import feedback_router, router as case_memory_router
 app.include_router(case_memory_router)
+app.include_router(feedback_router)
 
 
 def _safe_json(s: str):

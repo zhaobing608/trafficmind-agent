@@ -204,6 +204,14 @@ class DefinitionManager:
         返回问题列表，空列表表示可执行。
         """
         issues = definition.validate()
+        from backend.workflow.action_execution import contains_sensitive_key
+        for node in definition.nodes:
+            if node.node_type == NodeType.ACTION and contains_sensitive_key(
+                node.config.get("action_params", {})
+            ):
+                issues.append(
+                    f"Action 节点 '{node.node_id}' 参数包含禁止持久化的 credential/secret 字段"
+                )
         if definition.status == DefinitionStatus.DEPRECATED:
             issues.append("Definition 已废弃，不建议执行")
         return issues

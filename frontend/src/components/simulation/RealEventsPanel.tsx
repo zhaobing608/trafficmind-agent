@@ -27,6 +27,8 @@ import type { EventRelations, Relation } from './eventWorkbenchState';
 import { isCurrentEventRecord } from './eventReality';
 import './eventWorkbench.css';
 import { PilotMapPanel } from '../map/PilotMapPanel';
+import { EventTraceTimeline } from '../operations/EventTraceTimeline';
+import { EventFeedbackPanel } from './EventFeedbackPanel';
 
 const LIMIT = 50;
 
@@ -475,7 +477,7 @@ export const RealEventsPanel: React.FC<Props> = ({ focusEventId, focusRoadName, 
     setFilterType(''); setFilterStatus(''); setFilterRoad(''); setFilterRisk('');
     onClearFocus();
   };
-  const terminal = latestRun && ['completed', 'rejected', 'failed', 'cancelled'].includes(latestRun.status);
+  const terminal = Boolean(latestRun && ['completed', 'rejected', 'failed', 'cancelled'].includes(latestRun.status));
   const stageItems = [
     ['事件发现', selectedEvent ? '已记录' : '未选择'],
     ['AI 研判', queryText(relations.collaboration, latestCollaboration ? collaborationStatusLabel(latestCollaboration.status) : '暂无研判')],
@@ -616,6 +618,17 @@ export const RealEventsPanel: React.FC<Props> = ({ focusEventId, focusRoadName, 
                   {latestRun && onOpenRun && <button className="event-text-button" onClick={() => onOpenRun(latestRun.runId)}>查看执行</button>}
                 </div>
               </section>
+              <EventTraceTimeline
+                eventId={selectedEvent.eventId}
+                onOpenWorkflow={onOpenRun}
+                onOpenPlan={onOpenPlan}
+              />
+              {terminal && latestRun && (
+                <EventFeedbackPanel
+                  eventId={selectedEvent.eventId}
+                  workflowRunId={latestRun.runId}
+                />
+              )}
               {relations.workflow.status === 'SUCCESS_WITH_DATA' && onOpenRun && (
                 <details key={selectedEvent.eventId} className="event-technical" onToggle={e => setExpandedRunsFor(e.currentTarget.open ? selectedEvent.eventId : null)}>
                   <summary>全部相关执行（{relations.workflow.total}）</summary>

@@ -63,6 +63,12 @@ def grounding_audit_summary(context: Dict[str, Any]) -> Dict[str, Any]:
                 "caseId": item.get("caseId"),
                 "sourceWorkflowRunId": item.get("sourceWorkflowRunId"),
                 "finalStatus": item.get("finalStatus"),
+                "qualityStatus": item.get("qualityStatus"),
+                "experienceType": item.get("experienceType"),
+                "eventOutcome": (
+                    (item.get("outcome") or {}).get("eventOutcome")
+                    if isinstance(item.get("outcome"), dict) else None
+                ),
             }
             for item in (case_memory.get("cases") or [])[:MAX_RENDERED_REFS]
             if isinstance(item, dict)
@@ -116,6 +122,36 @@ def _facts(context: Dict[str, Any]) -> List[str]:
     if case_memory.get("cases"):
         case_ids = [str(c.get("caseId")) for c in case_memory.get("cases", [])[:3] if isinstance(c, dict)]
         facts.append(f"case_memory:{len(case_memory.get('cases') or [])} cases; {', '.join(case_ids)}")
+        for case in (case_memory.get("positiveCases") or [])[:2]:
+            if not isinstance(case, dict):
+                continue
+            recommendation = case.get("recommendation") if isinstance(case.get("recommendation"), dict) else {}
+            actions = [
+                str(item.get("actionType"))
+                for item in (recommendation.get("finalActions") or [])[:4]
+                if isinstance(item, dict) and item.get("actionType")
+            ]
+            facts.append(
+                "historical_success:"
+                f"case={case.get('caseId')},quality={case.get('qualityStatus')},"
+                f"final_actions={','.join(actions) or 'none'},"
+                f"why={case.get('whyRelevant') or 'same scoped context'}"
+            )
+        for case in (case_memory.get("negativeCases") or [])[:2]:
+            if not isinstance(case, dict):
+                continue
+            caution = case.get("caution") if isinstance(case.get("caution"), dict) else {}
+            failed = [
+                str(item.get("actionType"))
+                for item in (caution.get("failedActions") or [])[:4]
+                if isinstance(item, dict) and item.get("actionType")
+            ]
+            facts.append(
+                "known_failed_approach:"
+                f"case={case.get('caseId')},quality={case.get('qualityStatus')},"
+                f"actions={','.join(failed) or 'see_structured_rejection'},"
+                "use=caution_only"
+            )
     else:
         facts.append(f"case_memory:{case_memory.get('status', 'UNAVAILABLE')}")
     return facts

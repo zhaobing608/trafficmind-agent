@@ -56,7 +56,15 @@ async def execute_rag_retrieve(
             } if event.get("eventType") else None,
         )
         results = rag_result.get("results", rag_result.get("candidates", []))
-        trace_id = rag_result.get("traceId", "")
+        trace_value = rag_result.get("trace")
+        trace_payload = trace_value if isinstance(trace_value, dict) else {}
+        trace_id = str(
+            rag_result.get("traceId")
+            or rag_result.get("trace_id")
+            or trace_payload.get("traceId")
+            or trace_payload.get("trace_id")
+            or ""
+        )
     except Exception as e:
         degraded = True
         # 回退到 RAG V1
@@ -87,6 +95,7 @@ async def execute_rag_retrieve(
     state.add_audit_event("rag_retrieved", config.node_id, {
         "query": query,
         "resultCount": len(results),
+        "traceId": trace_id or None,
         "degraded": degraded,
     })
 

@@ -24,11 +24,12 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from backend.agent.streaming import sse_event, sse_error
 from backend.workflow.models import (
     ApprovalDecision,
+    ApprovalReasonCode,
     DefinitionStatus,
     WorkflowApproval,
     WorkflowRun,
@@ -37,7 +38,14 @@ from backend.workflow.models import (
 from backend.workflow.state import TrafficWorkflowState
 from backend.workflow.definition import DefinitionManager
 from backend.workflow.repository import SQLiteWorkflowRepository, init_workflow_tables
-from backend.workflow.executor import get_executor
+from backend.workflow.executor import definition_allows_action_execution, get_executor
+from backend.workflow.action_execution import (
+    contains_sensitive_key,
+    reconcile_action_execution,
+    request_action_execution_retry,
+    sanitize_public_text,
+    sanitize_public_value,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Router
@@ -66,7 +74,7 @@ class StartRunRequest(BaseModel):
     event: Dict[str, Any] = {}
     triggeredBy: Optional[str] = "api"
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
 
 class ResumeRunRequest(BaseModel):
@@ -74,19 +82,29 @@ class ResumeRunRequest(BaseModel):
     pass  # 当前不需要额外参数
 
 
+class CancelRunRequest(BaseModel):
+    """取消 Workflow Run 请求。"""
+    reason: Optional[str] = ""
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class RetryNodeRequest(BaseModel):
     """重试失败节点请求。"""
     nodeId: str
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class ApprovalRequest(BaseModel):
     """审批请求。"""
     action: str  # "approve", "reject", "edit_and_approve"
-    reviewer: Optional[str] = ""
-    comment: Optional[str] = ""
+    reviewer: Optional[str] = Field(default="", max_length=200)
+    comment: Optional[str] = Field(default="", max_length=1000)
+    reasonCode: Optional[ApprovalReasonCode] = ApprovalReasonCode.NONE
     editedActions: Optional[List[Dict[str, Any]]] = None
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -239,11 +257,13 @@ def _build_run_summary(
         "total": 0,
         "succeeded": 0,
         "failed": 0,
+        "unknown": 0,
     }
     if action_counts:
         act["total"] = action_counts.get("total", 0)
         act["succeeded"] = action_counts.get("succeeded", 0)
         act["failed"] = action_counts.get("failed", 0)
+        act["unknown"] = action_counts.get("unknown", 0)
     summary["actionSummary"] = act
 
     return summary
@@ -381,10 +401,27 @@ async def start_run(body: StartRunRequest):
     """
     executor = get_executor()
 
+    if contains_sensitive_key(body.event):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "credential_in_payload",
+                "message": "Workflow event 不允许包含 credential/secret 字段",
+            },
+        )
+
     # 获取 definition 名称（用于 SSE）
     definition = _repo.get_definition(body.definitionId)
     if definition is None:
         raise HTTPException(status_code=404, detail=f"Definition '{body.definitionId}' 不存在")
+    if not definition_allows_action_execution(definition):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "replay_execution_blocked",
+                "message": "该 Workflow 来自安全 replay run，默认禁止启动 Action 执行",
+            },
+        )
 
     async def _stream():
         try:
@@ -428,6 +465,258 @@ def _decision_provenance_or_empty(run: WorkflowRun) -> List[Dict[str, Any]]:
         return []
 
 
+def _runtime_projection(
+    run: WorkflowRun,
+    state: Dict[str, Any],
+    node_runs: List[Any],
+    approvals: List[WorkflowApproval],
+    action_records: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    """Project persisted runtime truth and valid user operations."""
+    current_event = state.get("currentEvent") if isinstance(state, dict) else {}
+    if not isinstance(current_event, dict):
+        current_event = {}
+
+    definition = _repo.get_definition(run.definition_id) if run.definition_id else None
+    metadata = definition.metadata if definition and isinstance(definition.metadata, dict) else {}
+    is_plan = bool(metadata.get("plan") or metadata.get("planFingerprint"))
+
+    completed_steps = state.get("completedSteps") or []
+    if not isinstance(completed_steps, list):
+        completed_steps = []
+    if not completed_steps:
+        for node_run in node_runs:
+            if node_run.status.value == "succeeded" and node_run.node_id not in completed_steps:
+                completed_steps.append(node_run.node_id)
+
+    failures = [
+        node_run for node_run in node_runs
+        if node_run.status.value in ("failed", "timed_out")
+    ]
+    failures.sort(key=lambda item: (item.started_at, item.attempt, item.node_run_id))
+    latest_failed = failures[-1] if failures else None
+    state_errors = state.get("errors") or []
+    state_failure = state_errors[-1] if state_errors and isinstance(state_errors[-1], dict) else {}
+    failure = None
+    if run.status == WorkflowRunStatus.FAILED:
+        failure = {
+            "nodeId": (
+                latest_failed.node_id if latest_failed is not None
+                else state_failure.get("nodeId") or run.current_node_id
+            ),
+            "message": (
+                latest_failed.error if latest_failed is not None and latest_failed.error
+                else state_failure.get("error") or "Workflow 执行失败"
+            ),
+            "attempt": (
+                latest_failed.attempt if latest_failed is not None
+                else int(state_failure.get("attempt", 0) or 0)
+            ),
+            "timestamp": state_failure.get("timestamp") or run.updated_at or None,
+        }
+
+    pending = state.get("pendingApproval")
+    approval_waiting = None
+    if run.status == WorkflowRunStatus.AWAITING_APPROVAL and isinstance(pending, dict):
+        approval_waiting = {
+            "approvalId": pending.get("approvalId"),
+            "nodeId": pending.get("nodeId"),
+            "createdAt": pending.get("createdAt"),
+            "proposedActions": sanitize_public_value(
+                pending.get("proposedActions") or []
+            ),
+        }
+
+    can_retry = run.status == WorkflowRunStatus.FAILED and latest_failed is not None
+    if can_retry:
+        failed_node_actions = [
+            action for action in (action_records or [])
+            if action.node_id == latest_failed.node_id
+        ]
+        failed_node_actions.sort(
+            key=lambda action: (
+                int(action.attempt or 0),
+                action.created_at,
+                action.action_id,
+            )
+        )
+        if failed_node_actions:
+            latest_action = failed_node_actions[-1]
+            can_retry = bool(
+                latest_action.status.value == "failed"
+                and latest_action.retryable
+            )
+    unknown_actions = [
+        action for action in (action_records or [])
+        if action.status.value == "unknown"
+    ]
+    can_resume = (
+        (run.status == WorkflowRunStatus.PAUSED and not unknown_actions)
+        or (
+            run.status == WorkflowRunStatus.AWAITING_APPROVAL
+            and not isinstance(pending, dict)
+        )
+    )
+    can_cancel = run.status in {
+        WorkflowRunStatus.PENDING,
+        WorkflowRunStatus.RUNNING,
+        WorkflowRunStatus.PAUSED,
+        WorkflowRunStatus.AWAITING_APPROVAL,
+    }
+
+    return {
+        "runtime": {
+            "eventId": current_event.get("eventId") or None,
+            "planId": run.definition_id if is_plan else None,
+            "currentStep": run.current_node_id or state.get("currentNode") or None,
+            "completedSteps": completed_steps,
+            "retryCount": int(state.get("retryCount", 0) or 0),
+            "failure": failure,
+            "approvalWaiting": approval_waiting,
+            "actionWaiting": (
+                {
+                    "actionExecutionId": unknown_actions[-1].action_id,
+                    "nodeId": unknown_actions[-1].node_id,
+                    "actionType": unknown_actions[-1].action_type,
+                    "status": "unknown",
+                    "message": "Action 执行结果待确认；请先 reconciliation",
+                }
+                if unknown_actions else None
+            ),
+            "cancelledAt": state.get("cancelledAt") or None,
+            "cancelReason": state.get("cancelReason") or None,
+            "startedAt": run.started_at or state.get("startedAt") or None,
+            "updatedAt": run.updated_at or state.get("updatedAt") or None,
+            "finishedAt": run.completed_at or state.get("finishedAt") or None,
+        },
+        "operations": {
+            "canRetry": can_retry,
+            "canResume": can_resume,
+            "canCancel": can_cancel,
+            "retryNodeId": latest_failed.node_id if can_retry else None,
+        },
+        "approvals": [_approval_public_projection(approval) for approval in approvals],
+    }
+
+
+def _approval_public_projection(approval: WorkflowApproval) -> Dict[str, Any]:
+    """Strip credential-shaped data from current and legacy approval rows."""
+    value = sanitize_public_value(approval.to_dict())
+    return value if isinstance(value, dict) else {}
+
+
+def _state_public_projection(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize the state subtrees that can carry untrusted action data."""
+    public = dict(state or {})
+    for key in (
+        "pendingApproval",
+        "pending_approval",
+        "proposedActions",
+        "proposed_actions",
+        "approvedActions",
+        "approved_actions",
+        "actionResults",
+        "action_results",
+        "nodeOutputs",
+        "node_outputs",
+        "auditTrail",
+        "audit_trail",
+    ):
+        if key in public:
+            public[key] = sanitize_public_value(public[key])
+    return public
+
+
+def _raise_mutation_error(result: Dict[str, Any]) -> None:
+    if "error" not in result:
+        return
+    code = str(result.get("errorCode") or "invalid_state")
+    status_code = 404 if code == "not_found" else 409
+    if code in {"invalid_parameters", "invalid_request"}:
+        status_code = 422
+    raise HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": str(result["error"])},
+    )
+
+
+def _action_public_projection(action: Any, run: WorkflowRun) -> Dict[str, Any]:
+    """Explicit allow-list DTO: no params, credentials, or raw provider body."""
+    attempts = _repo.list_action_attempts(action.action_id)
+    public_result = sanitize_public_value(action.result or {})
+    can_retry = bool(
+        action.status.value == "failed"
+        and action.retryable
+        and run.status in {WorkflowRunStatus.FAILED, WorkflowRunStatus.PAUSED}
+    )
+    can_reconcile = bool(
+        action.status.value == "unknown"
+        and action.reconciliation_supported
+        and run.status in {
+            WorkflowRunStatus.PAUSED,
+            WorkflowRunStatus.RUNNING,
+            WorkflowRunStatus.FAILED,
+        }
+    )
+    return {
+        "actionExecutionId": action.action_id,
+        "actionId": action.action_id,
+        "workflowRunId": action.run_id,
+        "nodeId": action.node_id,
+        "eventId": action.event_id or None,
+        "actionType": sanitize_public_text(action.action_type),
+        "idempotencyKey": action.idempotency_key,
+        "semanticActionVersion": action.semantic_action_version,
+        "attempt": int(action.attempt or 0),
+        "status": action.status.value,
+        "startedAt": (
+            action.started_at
+            or (
+                action.created_at
+                if action.status.value != "pending"
+                else None
+            )
+        ),
+        "finishedAt": action.finished_at or action.completed_at or None,
+        "externalReference": sanitize_public_text(action.external_reference) or None,
+        "message": (
+            str(public_result.get("message"))
+            if isinstance(public_result, dict) and public_result.get("message")
+            else None
+        ),
+        "result": public_result,
+        "error": sanitize_public_text(action.error) or None,
+        "lastReconciledAt": action.last_reconciled_at or None,
+        "unknownSince": action.unknown_since or None,
+        "reconciliationAttempts": int(action.reconciliation_attempts or 0),
+        "reconciliationSupported": bool(action.reconciliation_supported),
+        "reconciliationMessage": sanitize_public_text(
+            action.reconciliation_message
+        ) or None,
+        "retryable": bool(action.retryable),
+        "operations": {
+            "canRetry": can_retry,
+            "canReconcile": can_reconcile,
+        },
+        "attempts": [
+            {
+                "attemptId": attempt.attempt_id,
+                "attempt": attempt.attempt,
+                "status": attempt.status.value,
+                "startedAt": attempt.started_at or None,
+                "finishedAt": attempt.finished_at or None,
+                "externalReference": sanitize_public_text(
+                    attempt.external_reference
+                ) or None,
+                "result": sanitize_public_value(attempt.result or {}),
+                "error": sanitize_public_text(attempt.error) or None,
+                "lastReconciledAt": attempt.last_reconciled_at or None,
+            }
+            for attempt in attempts
+        ],
+    }
+
+
 @router.get("/runs/{run_id}", summary="查询 Workflow Run 详情")
 async def get_run(run_id: str):
     """查询单个 Workflow Run 的完整详情，包含状态、节点执行记录和 Trace。"""
@@ -438,6 +727,7 @@ async def get_run(run_id: str):
     node_runs = _repo.get_node_runs(run_id)
     events = _repo.list_events(run_id)
     action_records = _repo.list_action_records(run_id)
+    approvals = _repo.list_approvals(run_id)
 
     # 解析 state
     state = run.state
@@ -447,15 +737,20 @@ async def get_run(run_id: str):
         except Exception:
             state = {}
 
+    projection = _runtime_projection(run, state, node_runs, approvals, action_records)
+    public_state = _state_public_projection(state)
+    public_run = run.to_dict()
+    public_run["state"] = public_state
     return {
-        "run": run.to_dict(),
-        "state": state,
+        "run": public_run,
+        "state": public_state,
         "nodeRuns": [nr.to_dict() for nr in node_runs],
-        "events": [e.to_dict() for e in events],
-        "actionRecords": [a.to_dict() for a in action_records],
+        "events": [sanitize_public_value(e.to_dict()) for e in events],
+        "actionRecords": [_action_public_projection(a, run) for a in action_records],
         "nodeCount": len(node_runs),
         "eventCount": len(events),
         "decisionProvenance": _decision_provenance_or_empty(run),
+        **projection,
     }
 
 
@@ -469,6 +764,8 @@ async def get_run_trace(run_id: str):
     node_runs = _repo.get_node_runs(run_id)
     events = _repo.list_events(run_id)
     action_records = _repo.list_action_records(run_id)
+    approvals = _repo.list_approvals(run_id)
+    state = run.state if isinstance(run.state, dict) else {}
 
     # 构建时间线
     timeline = []
@@ -477,7 +774,7 @@ async def get_run_trace(run_id: str):
             "sequence": e.sequence,
             "eventType": e.event_type,
             "nodeId": e.node_id,
-            "payload": e.payload,
+            "payload": sanitize_public_value(e.payload),
             "createdAt": e.created_at,
         })
 
@@ -500,12 +797,47 @@ async def get_run_trace(run_id: str):
             }
             for nr in node_runs
         ],
-        "actionRecords": [a.to_dict() for a in action_records],
-        "ragTraceIds": [],
-        "agentRunIds": [],
-        "approvalIds": [],
+        "actionRecords": [_action_public_projection(a, run) for a in action_records],
+        "ragTraceIds": list(state.get("ragTraceIds") or []),
+        "agentRunIds": list(state.get("agentRunIds") or []),
+        "approvalIds": [approval.approval_id for approval in approvals],
         "actionRecordIds": [a.action_id for a in action_records],
+        "approvals": [_approval_public_projection(approval) for approval in approvals],
     }
+
+
+@router.get(
+    "/runs/{run_id}/actions/{action_execution_id}",
+    summary="查询 Action Execution 详情",
+)
+async def get_action_execution(run_id: str, action_execution_id: str):
+    run = _repo.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Workflow Run 不存在")
+    action = _repo.get_action_record(action_execution_id)
+    if action is None or action.run_id != run_id:
+        raise HTTPException(status_code=404, detail="Action Execution 不存在")
+    return _action_public_projection(action, run)
+
+
+@router.post(
+    "/runs/{run_id}/actions/{action_execution_id}/retry",
+    summary="重试已确认失败的 Action",
+)
+async def retry_action_execution(run_id: str, action_execution_id: str):
+    result = request_action_execution_retry(_repo, run_id, action_execution_id)
+    _raise_mutation_error(result)
+    return result
+
+
+@router.post(
+    "/runs/{run_id}/actions/{action_execution_id}/reconcile",
+    summary="对账 UNKNOWN Action",
+)
+async def reconcile_action(run_id: str, action_execution_id: str):
+    result = await reconcile_action_execution(_repo, run_id, action_execution_id)
+    _raise_mutation_error(result)
+    return result
 
 
 @router.post("/runs/{run_id}/resume", summary="恢复 Workflow Run（SSE 流式）")
@@ -517,6 +849,38 @@ async def resume_run(run_id: str, body: ResumeRunRequest = None):
     run = _repo.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' 不存在")
+    state = run.state if isinstance(run.state, dict) else {}
+    pending = state.get("pendingApproval")
+    if run.status not in {
+        WorkflowRunStatus.PAUSED,
+        WorkflowRunStatus.AWAITING_APPROVAL,
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "invalid_status",
+                "message": f"Run '{run_id}' 状态为 {run.status.value}，无法恢复",
+            },
+        )
+    if any(
+        action.status.value == "unknown"
+        for action in _repo.list_action_records(run_id)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "reconcile_required",
+                "message": "Run 存在 UNKNOWN Action，必须先 reconciliation，不能直接 resume",
+            },
+        )
+    if run.status == WorkflowRunStatus.AWAITING_APPROVAL and isinstance(pending, dict):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "approval_pending",
+                "message": "Run 仍有待处理审批，审批完成前不能 resume",
+            },
+        )
 
     executor = get_executor()
 
@@ -544,12 +908,11 @@ async def resume_run(run_id: str, body: ResumeRunRequest = None):
 
 
 @router.post("/runs/{run_id}/cancel", summary="取消 Workflow Run")
-async def cancel_run(run_id: str):
+async def cancel_run(run_id: str, body: CancelRunRequest = None):
     """取消正在执行的 Workflow Run。"""
     executor = get_executor()
-    result = await executor.cancel(run_id)
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
+    result = await executor.cancel(run_id, reason=(body.reason if body else "") or "")
+    _raise_mutation_error(result)
     return result
 
 
@@ -558,8 +921,7 @@ async def retry_node(run_id: str, body: RetryNodeRequest):
     """重试 Workflow Run 中失败的节点。"""
     executor = get_executor()
     result = await executor.retry_node(run_id, body.nodeId)
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
+    _raise_mutation_error(result)
     return result
 
 
@@ -575,24 +937,41 @@ async def process_approval(run_id: str, approval_id: str, body: ApprovalRequest)
     executor = get_executor()
 
     action = body.action
+    reviewer = sanitize_public_text(body.reviewer or "")[:200]
+    comment = sanitize_public_text(body.comment or "")[:1000]
+    reason_code = (body.reasonCode or ApprovalReasonCode.NONE).value
+    if action == "edit_and_approve" and contains_sensitive_key(
+        body.editedActions or []
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_parameters",
+                "message": "审批编辑内容包含禁止持久化的 credential/secret 字段",
+            },
+        )
     if action == "approve":
         result = await executor.approve(
             run_id,
-            reviewer=body.reviewer or "",
-            comment=body.comment or "",
+            reviewer=reviewer,
+            comment=comment,
+            approval_id=approval_id,
         )
     elif action == "reject":
         result = await executor.reject(
             run_id,
-            reviewer=body.reviewer or "",
-            comment=body.comment or "",
+            reviewer=reviewer,
+            comment=comment,
+            reason_code=reason_code,
+            approval_id=approval_id,
         )
     elif action == "edit_and_approve":
         result = await executor.edit_and_approve(
             run_id,
             edited_actions=body.editedActions or [],
-            reviewer=body.reviewer or "",
-            comment=body.comment or "",
+            reviewer=reviewer,
+            comment=comment,
+            approval_id=approval_id,
         )
     else:
         raise HTTPException(
@@ -600,8 +979,7 @@ async def process_approval(run_id: str, approval_id: str, body: ApprovalRequest)
             detail=f"无效的审批动作 '{action}'。有效值: approve, reject, edit_and_approve",
         )
 
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
+    _raise_mutation_error(result)
     return result
 
 
@@ -635,9 +1013,9 @@ async def get_run_stream(run_id: str):
         # 发送 action 记录
         action_records = _repo.list_action_records(run_id)
         for ar in action_records:
-            yield sse_event("action_status", ar.to_dict())
+            yield sse_event("action_status", _action_public_projection(ar, run))
 
-        yield sse_event("done", {"runId": run_id})
+        yield sse_event("done", {"runId": run_id, "status": run.status.value})
 
     return StreamingResponse(
         _stream(),

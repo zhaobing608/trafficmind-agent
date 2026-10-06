@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -159,6 +160,15 @@ def _context_pack_b() -> dict:
     }
 
 
+def _fixture_before(value: str, minutes: int) -> str:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (parsed.astimezone(timezone.utc) - timedelta(minutes=minutes)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
 def _seed_event(
     event_id: str,
     *,
@@ -188,6 +198,15 @@ def _seed_event(
         "analyzedAt": analyzed_at,
         "debugPayload": "FULL_RESULT_SENTINEL",
     })
+    conn = sqlite3.connect(cfg.DB_PATH)
+    try:
+        conn.execute(
+            "UPDATE event_records SET updatedAt=? WHERE eventId=?",
+            (analyzed_at, event_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _bind_event(
@@ -197,6 +216,7 @@ def _bind_event(
     region_id: str = "REGION_A",
     road_id: str = "ROAD_A_MAIN",
     intersection_id: str = "INT_A_MAIN",
+    bound_at: str | None = None,
 ) -> None:
     regional_repo.save_resolved_event_location_binding({
         "status": "resolved",
@@ -207,6 +227,34 @@ def _bind_event(
         "resolutionMethod": "exact_alias",
         "matchedAlias": "人民路",
     })
+    effective_bound_at = bound_at
+    if not effective_bound_at:
+        conn = sqlite3.connect(cfg.DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT createdAt FROM event_records WHERE eventId=?",
+                (event_id,),
+            ).fetchone()
+            effective_bound_at = str(row[0]) if row and row[0] else None
+        finally:
+            conn.close()
+    if effective_bound_at:
+        conn = sqlite3.connect(cfg.DB_PATH)
+        try:
+            conn.execute(
+                """UPDATE event_location_bindings
+                   SET resolved_at=?, created_at=?, updated_at=?
+                   WHERE event_id=? AND status='resolved'""",
+                (
+                    effective_bound_at,
+                    effective_bound_at,
+                    effective_bound_at,
+                    event_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def _save_collaboration_chain(
@@ -215,7 +263,10 @@ def _save_collaboration_chain(
     event_id: str,
     collaboration_run_id: str,
     session_id: str,
+    completed_at: str = "2026-06-30T08:07:00Z",
 ) -> None:
+    started_at = _fixture_before(completed_at, 2)
+    task_completed_at = _fixture_before(completed_at, 1)
     repo.save_run({
         "run_id": collaboration_run_id,
         "session_id": session_id,
@@ -229,8 +280,8 @@ def _save_collaboration_chain(
         "selected_agents": ["CongestionAgent", "DispatchAgent"],
         "failed_agents": [],
         "final_decision": {"summary": "建议先通知值守人员，并观察拥堵回落。"},
-        "started_at": "2026-06-30T08:05:00Z",
-        "completed_at": "2026-06-30T08:07:00Z",
+        "started_at": started_at,
+        "completed_at": completed_at,
     })
     repo.save_task(collaboration_run_id, {
         "task_id": "task_congestion",
@@ -248,7 +299,7 @@ def _save_collaboration_chain(
             ],
             "evidenceRefs": [{"docId": "doc_policy", "chunkId": "chunk_1"}],
         },
-        "completed_at": "2026-06-30T08:06:00Z",
+        "completed_at": task_completed_at,
     })
     repo.save_message({
         "message_id": f"msg_{collaboration_run_id}",
@@ -258,8 +309,22 @@ def _save_collaboration_chain(
         "receiver": "FusionAgent",
         "message_type": "analysis",
         "payload": {"rawTranscriptSentinel": "MUST_NOT_STORE_RAW_MESSAGE"},
-        "created_at": "2026-06-30T08:06:30Z",
+        "created_at": task_completed_at,
     })
+    conn = sqlite3.connect(cfg.DB_PATH)
+    try:
+        conn.execute(
+            "UPDATE collaboration_runs SET updated_at=? WHERE run_id=?",
+            (completed_at, collaboration_run_id),
+        )
+        conn.execute(
+            """UPDATE collaboration_tasks SET started_at=?, completed_at=?
+               WHERE run_id=?""",
+            (started_at, task_completed_at, collaboration_run_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _save_plan_definition(
@@ -270,7 +335,14 @@ def _save_plan_definition(
     collaboration_run_id: str = "",
     version: int = 1,
     goal_type: GoalType = GoalType.CONGESTION_RESOLUTION,
+    created_at: str | None = None,
 ) -> Plan:
+    plan_updated_at = created_at or "2026-06-30T08:09:00Z"
+    plan_created_at = (
+        _fixture_before(plan_updated_at, 1)
+        if created_at
+        else "2026-06-30T08:08:00Z"
+    )
     steps = [
         PlanStep(
             stepId="validate_event",
@@ -315,8 +387,8 @@ def _save_plan_definition(
                 "rejectedActions": [{"actionType": "simulation_monitor", "reason": "simulation_only"}],
             },
         },
-        createdAt="2026-06-30T08:08:00Z",
-        updatedAt="2026-06-30T08:09:00Z",
+        createdAt=plan_created_at,
+        updatedAt=plan_updated_at,
     )
     definition = plan_to_definition(plan)
     repo.save_definition(definition)
@@ -326,7 +398,7 @@ def _save_plan_definition(
         version=version,
         definition_json=definition.to_dict(),
         changelog="fixture",
-        created_at=f"2026-06-30T08:09:0{version}Z",
+        created_at=created_at or f"2026-06-30T08:09:0{version}Z",
     ))
     return plan
 
@@ -346,15 +418,25 @@ def _save_workflow_chain(
     state_extra: dict | None = None,
     goal_type: GoalType = GoalType.CONGESTION_RESOLUTION,
 ) -> None:
-    _seed_event(event_id)
+    plan_created_at = _fixture_before(completed_at, 51)
+    run_started_at = _fixture_before(completed_at, 50)
+    approval_created_at = _fixture_before(completed_at, 40)
+    approval_decided_at = _fixture_before(completed_at, 39)
+    action_created_at = _fixture_before(completed_at, 38)
+    _seed_event(event_id, analyzed_at=_fixture_before(completed_at, 60))
     if bind_location:
-        _bind_event(isolated["regionalRepo"], event_id)
+        _bind_event(
+            isolated["regionalRepo"],
+            event_id,
+            bound_at=_fixture_before(completed_at, 55),
+        )
     if save_collaboration:
         _save_collaboration_chain(
             isolated["collaborationRepo"],
             event_id=event_id,
             collaboration_run_id=collaboration_run_id,
             session_id=session_id,
+            completed_at=_fixture_before(completed_at, 53),
         )
     _save_plan_definition(
         isolated["workflowRepo"],
@@ -362,6 +444,7 @@ def _save_workflow_chain(
         event_id=event_id,
         collaboration_run_id=collaboration_run_id,
         goal_type=goal_type,
+        created_at=plan_created_at,
     )
     state = {
         "currentEvent": {"eventId": event_id, "eventType": "congestion"},
@@ -378,7 +461,7 @@ def _save_workflow_chain(
         status=status,
         current_node_id="close",
         state=state,
-        started_at="2026-06-30T08:10:00Z",
+        started_at=run_started_at,
         updated_at=completed_at,
         completed_at=completed_at,
         triggered_by="test",
@@ -399,8 +482,8 @@ def _save_workflow_chain(
         decision=decision,
         reviewer="operator_a",
         comment="同意调整通知渠道" if decision == ApprovalDecision.EDITED else "证据不足，驳回",
-        created_at="2026-06-30T08:20:00Z",
-        decided_at="2026-06-30T08:21:00Z",
+        created_at=approval_created_at,
+        decided_at=approval_decided_at,
     ))
     action_status = ActionStatus.FAILED if status == WorkflowRunStatus.FAILED else ActionStatus.SUCCEEDED
     isolated["workflowRepo"].save_action_record(WorkflowActionRecord(
@@ -412,7 +495,7 @@ def _save_workflow_chain(
         result={"sent": action_status == ActionStatus.SUCCEEDED},
         status=action_status,
         error="provider timeout" if action_status == ActionStatus.FAILED else "",
-        created_at="2026-06-30T08:22:00Z",
+        created_at=action_created_at,
         completed_at=completed_at,
     ))
 
@@ -936,7 +1019,10 @@ def test_first_build_race_returns_existing_case_without_duplicate(service, isola
             self.reads += 1
             return None if self.reads == 1 else built_case
 
-        def insert_case(self, case):
+        def get_feedback(self, event_id, workflow_run_id):
+            return None
+
+        def insert_case(self, case, *, expected_feedback_revision=None):
             raise sqlite3.IntegrityError("source_workflow_run_id")
 
     race_repo = RaceRepo()

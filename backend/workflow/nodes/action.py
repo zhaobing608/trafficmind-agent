@@ -4,7 +4,7 @@ action 节点 — 外部动作执行。
 执行经批准的外部动作（通知、信号调整、派单等）。
 
 幂等性保证：
-  - 使用 idempotency_key = {runId}:{nodeId}:{actionType}
+  - 使用 idempotency identity = {runId}:{nodeId}:{actionType}:{semanticActionVersion}
   - 重复 resume 或 retry 不重复执行已成功动作
   - 通过 WorkflowActionRecord 表做幂等检查
 
@@ -12,6 +12,7 @@ action 节点 — 外部动作执行。
 """
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 from backend.workflow.models import (
@@ -19,6 +20,7 @@ from backend.workflow.models import (
     NodeConfig,
     WorkflowActionRecord,
     compute_action_idempotency_key,
+    compute_legacy_action_idempotency_key,
     generate_action_id,
 )
 from backend.workflow.state import TrafficWorkflowState
@@ -26,6 +28,15 @@ from backend.agent.tool_policy import (
     ToolExecutionStatus,
     classify_tool_result,
     enforce_tool_request,
+)
+from backend.agent.tool_registry import ToolRisk, get_tool_registry
+from backend.workflow.action_execution import (
+    ActionExecutionContext,
+    ActionExecutorResult,
+    contains_sensitive_key,
+    get_action_executor_registry,
+    sanitize_public_value,
+    sanitize_public_text,
 )
 
 
@@ -43,7 +54,8 @@ _ACTION_TYPE_ALIASES = {
 
 def _canonical_action_type(action_type: str) -> str:
     """将 action type 归一化到 workflow action_type 命名空间。"""
-    return _ACTION_TYPE_ALIASES.get(action_type, action_type)
+    normalized = str(action_type or "").strip().lower()
+    return _ACTION_TYPE_ALIASES.get(normalized, normalized)
 
 
 def is_current_action_approved(
@@ -95,37 +107,103 @@ def is_current_action_approved(
     return False
 
 
+def _durable_approval_allows(repository, run_id: str, config: NodeConfig, action_type: str) -> bool:
+    """Last-line high-risk approval check using persisted server-owned data."""
+    if repository is None:
+        return False
+    identity_version = int(config.config.get("approval_identity_version", 1) or 1)
+    for approval in repository.list_approvals(run_id):
+        if approval.decision.value not in {"approved", "edited"}:
+            continue
+        actions = approval.edited_actions if approval.decision.value == "edited" else approval.proposed_actions
+        for item in actions or []:
+            if not isinstance(item, dict):
+                continue
+            if identity_version >= 2:
+                if item.get("actionStepId") == config.node_id:
+                    return True
+            else:
+                candidate = item.get("actionType") or item.get("action_type")
+                if candidate and _canonical_action_type(str(candidate)) == _canonical_action_type(action_type):
+                    return True
+    return False
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 async def execute_action(
     state: TrafficWorkflowState, config: NodeConfig, repository=None,
     driver_owner: str = "", driver_generation: int = 0,
+    defer_terminal: bool = False,
 ) -> Dict[str, Any]:
-    """执行外部动作。
+    """Validate, claim, execute and durably close one action attempt.
 
-    执行前检查：
-      1. 是否已经过审批（如有 approval 节点）
-      2. 幂等键是否已存在成功记录
-      3. driver lease ownership（fencing，driver-managed 时）
-
-    Args:
-        state: 工作流状态
-        config: 节点配置
-          - config.action_type: 动作类型（"notify_wechat", "adjust_signal" 等）
-          - config.action_params: 动作参数
-        repository: Workflow 持久化仓库（用于幂等检查）
-        driver_owner / driver_generation: driver context（fencing 校验）
-
-    Returns:
-        执行结果
+    Workflow callers set ``defer_terminal`` so the action terminal result and
+    the node/run checkpoint commit in one SQLite transaction.  Direct callers
+    still receive a self-contained, durably finalised execution.
     """
-    action_type = config.config.get("action_type", "")
+    action_type = _canonical_action_type(config.config.get("action_type", ""))
     if not action_type:
         return {"error": "action 节点缺少 action_type 配置"}
+    semantic_version = str(
+        config.config.get("semantic_action_version")
+        or config.config.get("semanticActionVersion")
+        or "v1"
+    )
+    action_id = generate_action_id()
+    idempotency_key = compute_action_idempotency_key(
+        state.workflow_run_id, config.node_id, action_type, semantic_version
+    )
+    legacy_idempotency_key = (
+        compute_legacy_action_idempotency_key(
+            state.workflow_run_id, config.node_id, action_type
+        )
+        if semantic_version == "v1"
+        else ""
+    )
+
+    def _record_block(reason: str) -> None:
+        """Persist a credential-free denial with canonical run/event scope."""
+        payload = {
+            "actionExecutionId": action_id,
+            "workflowRunId": state.workflow_run_id,
+            "nodeId": config.node_id,
+            "eventId": str((state.current_event or {}).get("eventId") or "") or None,
+            "actionType": action_type,
+            "attempt": 0,
+            "idempotencyKey": idempotency_key,
+            "reason": str(reason)[:500],
+        }
+        state.add_audit_event("action_blocked", config.node_id, payload)
+        if repository is not None and state.workflow_run_id:
+            repository.append_event(
+                state.workflow_run_id,
+                "action_blocked",
+                node_id=config.node_id,
+                payload=payload,
+            )
+
+    if (state.current_event or {}).get("actionExecutionAllowed") is False:
+        _record_block("replay run is analysis-only")
+        return {
+            "action_type": action_type,
+            "status": "denied",
+            "executed": False,
+            "reason": "replay run is analysis-only",
+            "error": "replay run is analysis-only",
+        }
 
     def _driver_gate() -> str:
         """driver-managed execution gate：identity + lease 未过期 + 非 CANCELLED。
 
         返回 'ok' | 'cancelled' | 'lease_lost'。legacy（无 driver context）恒为 'ok'。
         """
+        if repository:
+            durable = repository.get_run(state.workflow_run_id)
+            if durable is not None and durable.status.value == "cancelled":
+                return "cancelled"
         if not repository or not driver_owner:
             return "ok"
         if repository.is_driver_execution_valid(state.workflow_run_id, driver_owner, driver_generation):
@@ -137,6 +215,7 @@ async def execute_action(
 
     def _lease_lost_result() -> Dict[str, Any]:
         return {
+            "actionExecutionId": action_id,
             "action_type": action_type,
             "status": "lease_lost",
             "executed": False,
@@ -145,31 +224,20 @@ async def execute_action(
 
     def _cancelled_result(reason: str) -> Dict[str, Any]:
         return {
+            "actionExecutionId": action_id,
             "action_type": action_type,
             "status": "cancelled",
             "executed": False,
             "reason": reason,
         }
 
-    def _finalize_marker_cancelled() -> None:
-        """EXECUTING marker 已 persist，但 cancel 发生在真正 dispatch 前 → 终结为 known-not-dispatched。
+    reliable_executor = get_action_executor_registry().get(action_type)
+    canonical_action_type = (
+        get_action_executor_registry().canonical(action_type)
+        if reliable_executor is not None else action_type
+    )
 
-        优先写 FAILED / cancelled_before_dispatch；terminal marker 更新失败则保守保留 EXECUTING
-        （→ recovery human review / UNKNOWN），但绝不 dispatch。
-        """
-        if not repository:
-            return
-        record.status = ActionStatus.FAILED
-        record.error = "cancelled_before_dispatch"
-        record.result = {"cancelled": True, "dispatched": False}
-        record.completed_at = record.created_at
-        try:
-            repository.save_action_record(record)
-        except Exception:
-            pass
-
-    # ── ToolPolicy 门禁（Section 11/12/13）：外部动作必须先通过 ToolPolicy ──
-    # 未知工具 fail-closed；高风险工具未批准则阻止执行并返回 approval_required。
+    # ToolPolicy is the first gate; persisted approval below is the final gate.
     risk = state.risk_assessment or {}
     _policy = enforce_tool_request(
         action_type,
@@ -180,9 +248,11 @@ async def execute_action(
     if not _policy["allowed"]:
         audit_payload = {
             **_policy["audit"],  # tool, caller, riskLevel, decision, reason, timestamp
+            "actionExecutionId": action_id,
             "actionType": action_type,
             "workflowRunId": state.workflow_run_id,
             "nodeId": config.node_id,
+            "attempt": 0,
             "executed": False,
         }
         event_type = (
@@ -191,7 +261,9 @@ async def execute_action(
             else "tool_approval_required"
         )
         state.add_audit_event(event_type, config.node_id, audit_payload)
+        _record_block(_policy["reason"])
         return {
+            "actionExecutionId": action_id,
             "action_type": action_type,
             "status": _policy["status"],
             "executed": False,
@@ -202,6 +274,7 @@ async def execute_action(
     # 检查是否有待审批但未批准的审批
     pending = state.pending_approval
     if pending:
+        _record_block("存在未处理的审批，不能执行外部动作")
         return {
             "error": "存在未处理的审批，不能执行外部动作",
             "approval_id": pending.get("approvalId"),
@@ -211,15 +284,26 @@ async def execute_action(
     # Phase18 V2：business params 来自 compiler 归一化的 config.action_params，
     # 不由 approved_actions 覆盖（approved_actions 仅作审批绑定，不含 params）。
     action_params = config.config.get("action_params", {})
+    if not isinstance(action_params, dict):
+        action_params = {}
     identity_version = config.config.get("approval_identity_version", 1)
     if identity_version < 2 and state.approved_actions:
         # 查找匹配当前 action_type 的已批准动作
         for approved in state.approved_actions:
-            if isinstance(approved, dict) and approved.get("actionType") == action_type:
-                action_params = approved.get("params", approved.get("action_params", approved))
+            if (
+                isinstance(approved, dict)
+                and _canonical_action_type(approved.get("actionType", "")) == action_type
+            ):
+                edited_params = approved.get("params", approved.get("action_params"))
+                if isinstance(edited_params, dict):
+                    action_params = edited_params
                 break
             # Phase 13: 结构化 proposal 直接使用自身作为 params
-            if isinstance(approved, dict) and approved.get("actionType"):
+            if (
+                isinstance(approved, dict)
+                and approved.get("actionType")
+                and action_type.startswith("simulation_")
+            ):
                 # 映射 agent proposal 格式到 action 格式
                 action_params = {
                     "targetIds": approved.get("sourceRoadId", approved.get("targetRoadIds", [])),
@@ -235,84 +319,376 @@ async def execute_action(
                     action_params["targetIds"] = [approved.get("sourceRoadId", tr[0])] + tr
                 break
 
-    # 幂等键
-    idempotency_key = compute_action_idempotency_key(
-        state.workflow_run_id, config.node_id, action_type
-    )
+    # Credentials are server configuration, never plan/action parameters.
+    if contains_sensitive_key(action_params):
+        reason = "Action 参数包含禁止持久化的 credential/secret 字段"
+        _record_block(reason)
+        return {
+            "action_type": canonical_action_type,
+            "status": "blocked",
+            "executed": False,
+            "reason": reason,
+            "error": reason,
+        }
+    safe_params = sanitize_public_value(action_params)
+    if not isinstance(safe_params, dict):
+        safe_params = {}
 
-    # 幂等检查（如果提供了 repository）
-    if repository:
-        try:
-            existing = repository.get_action_record_by_idempotency_key(idempotency_key)
-        except Exception as e:
-            # 幂等检查失败 → fail-closed，不 dispatch
-            state.add_audit_event("action_idempotency_check_failed", config.node_id, {
-                "actionType": action_type, "idempotencyKey": idempotency_key,
-                "reason": f"idempotency check failed: {str(e)[:200]}",
-            })
+    # Immutable replay/canonical identity and durable high-risk approval fence.
+    durable_run = repository.get_run(state.workflow_run_id) if repository and state.workflow_run_id else None
+    definition = None
+    if durable_run is not None:
+        durable_state = durable_run.state if isinstance(durable_run.state, dict) else {}
+        durable_event = durable_state.get("currentEvent") or {}
+        durable_event_id = str(durable_event.get("eventId") or "") if isinstance(durable_event, dict) else ""
+        state_event_id = str((state.current_event or {}).get("eventId") or "")
+        durable_pending = (
+            durable_state.get("pendingApproval")
+            or durable_state.get("pending_approval")
+        )
+        if isinstance(durable_pending, dict):
+            _record_block("持久化 Workflow 仍存在未处理审批")
             return {
-                "action_type": action_type,
-                "status": "failed",
+                "action_type": canonical_action_type,
+                "status": "blocked",
                 "executed": False,
-                "reason": f"idempotency check failed: {str(e)[:200]}",
+                "reason": "持久化 Workflow 仍存在未处理审批",
+                "error": "持久化 Workflow 仍存在未处理审批",
             }
-        if existing is not None:
-            if existing.status == ActionStatus.SUCCEEDED:
-                state.add_audit_event("action_idempotent_skip", config.node_id, {
-                    "actionType": action_type,
-                    "idempotencyKey": idempotency_key,
-                    "reason": "已成功执行，幂等跳过",
-                })
+        durable_approved = durable_state.get("approvedActions")
+        if durable_approved is None:
+            durable_approved = durable_state.get("approved_actions") or []
+        if reliable_executor is not None and list(state.approved_actions or []) != list(
+            durable_approved or []
+        ):
+            _record_block("Action approval state 与 durable Workflow 不一致")
+            return {
+                "action_type": canonical_action_type,
+                "status": "blocked",
+                "executed": False,
+                "reason": "Action approval state 与 durable Workflow 不一致",
+                "error": "Action approval state 与 durable Workflow 不一致",
+            }
+        if durable_event.get("actionExecutionAllowed") is False:
+            _record_block("replay run is analysis-only")
+            return {
+                "action_type": canonical_action_type,
+                "status": "blocked",
+                "executed": False,
+                "reason": "replay run is analysis-only",
+                "error": "replay run is analysis-only",
+            }
+        if reliable_executor is not None and (not durable_event_id or durable_event_id != state_event_id):
+            _record_block("canonical event identity mismatch")
+            return {
+                "action_type": canonical_action_type,
+                "status": "blocked",
+                "executed": False,
+                "reason": "canonical event identity mismatch",
+                "error": "canonical event identity mismatch",
+            }
+        definition = None
+        if durable_run.definition_id:
+            # A Run is bound to an immutable Definition version.  The mutable
+            # latest definition must never authorize parameters or action types
+            # for an already-created Run.
+            durable_version = repository.get_definition_version(
+                durable_run.definition_id,
+                durable_run.version,
+            )
+            if durable_version is not None:
+                from backend.workflow.models import WorkflowDefinition
+                definition = WorkflowDefinition.from_dict(
+                    durable_version.definition_json
+                )
+            else:
+                # Compatibility for old/direct records created before version
+                # snapshots were mandatory.
+                definition = repository.get_definition(durable_run.definition_id)
+        if definition is not None:
+            metadata = definition.metadata if isinstance(definition.metadata, dict) else {}
+            plan_metadata = metadata.get("plan") if isinstance(metadata.get("plan"), dict) else {}
+            nested_plan_metadata = (
+                plan_metadata.get("metadata")
+                if isinstance(plan_metadata.get("metadata"), dict)
+                else {}
+            )
+            if (
+                metadata.get("actionExecutionAllowed") is False
+                or metadata.get("runKind") == "replay"
+                or plan_metadata.get("actionExecutionAllowed") is False
+                or plan_metadata.get("runKind") == "replay"
+                or nested_plan_metadata.get("actionExecutionAllowed") is False
+                or nested_plan_metadata.get("runKind") == "replay"
+            ):
+                _record_block("replay-derived definition cannot execute actions")
                 return {
-                    "action_type": action_type,
-                    "status": "skipped",
-                    "reason": "idempotent_skip",
-                    "previous_result": existing.result,
-                }
-            if existing.status == ActionStatus.EXECUTING:
-                # 已有 in-flight/unknown attempt → no second dispatch（fail closed）
-                state.add_audit_event("action_inflight_conflict", config.node_id, {
-                    "actionType": action_type, "idempotencyKey": idempotency_key,
-                    "reason": "已有 EXECUTING attempt，禁止二次 dispatch",
-                })
-                return {
-                    "action_type": action_type,
-                    "status": "in_flight",
+                    "action_type": canonical_action_type,
+                    "status": "blocked",
                     "executed": False,
-                    "reason": "existing EXECUTING attempt",
-                    "error": "existing EXECUTING attempt",  # 使 executor 判为 node 失败（不 SUCCEEDED）
+                    "reason": "replay-derived definition cannot execute actions",
+                    "error": "replay-derived definition cannot execute actions",
                 }
 
-    # 创建动作记录
-    action_id = generate_action_id()
+    if reliable_executor is not None:
+        if durable_run is None or definition is None:
+            if durable_run is not None:
+                _record_block("reliable Action 必须绑定持久化 Workflow Definition/Run")
+            return {
+                "action_type": canonical_action_type,
+                "status": "blocked",
+                "executed": False,
+                "reason": "reliable Action 必须绑定持久化 Workflow Definition/Run",
+                "error": "reliable Action 必须绑定持久化 Workflow Definition/Run",
+            }
+        durable_node = definition.get_node(config.node_id)
+        durable_action_type = (
+            _canonical_action_type(durable_node.config.get("action_type", ""))
+            if durable_node is not None else ""
+        )
+        durable_params = (
+            durable_node.config.get("action_params", {})
+            if durable_node is not None
+            else {}
+        )
+        configured_params = config.config.get("action_params", {})
+        durable_identity_version = int(
+            durable_node.config.get("approval_identity_version", 1) or 1
+        ) if durable_node is not None else 1
+        configured_identity_version = int(
+            config.config.get("approval_identity_version", 1) or 1
+        )
+        durable_semantic_version = str(
+            durable_node.config.get("semantic_action_version")
+            or durable_node.config.get("semanticActionVersion")
+            or "v1"
+        ) if durable_node is not None else "v1"
+        configured_semantic_version = str(
+            config.config.get("semantic_action_version")
+            or config.config.get("semanticActionVersion")
+            or "v1"
+        )
+        if (
+            durable_node is None
+            or durable_node.node_type.value != "action"
+            or durable_action_type != action_type
+            or durable_params != configured_params
+            or durable_identity_version != configured_identity_version
+            or durable_semantic_version != configured_semantic_version
+        ):
+            _record_block("Action 与不可变 Workflow Definition 不匹配")
+            return {
+                "action_type": canonical_action_type,
+                "status": "blocked",
+                "executed": False,
+                "reason": "Action 与不可变 Workflow Definition 不匹配",
+                "error": "Action 与不可变 Workflow Definition 不匹配",
+            }
+
+    tool_meta = get_tool_registry().get(action_type)
+    if (
+        tool_meta is not None
+        and tool_meta.riskLevel == ToolRisk.HIGH_RISK
+        and repository is not None
+        and durable_run is not None
+        and not _durable_approval_allows(repository, state.workflow_run_id, config, action_type)
+    ):
+        reason = "high-risk Action 缺少有效 durable approval"
+        _record_block(reason)
+        return {
+            "action_type": canonical_action_type,
+            "status": "blocked",
+            "executed": False,
+            "reason": reason,
+            "error": reason,
+        }
+
+    if reliable_executor is not None and repository is None:
+        return {
+            "action_type": canonical_action_type,
+            "status": "blocked",
+            "executed": False,
+            "reason": "reliable Action requires durable repository",
+            "error": "reliable Action requires durable repository",
+        }
+    if reliable_executor is not None:
+        from backend.tools.db_tools import get_event_by_id
+        canonical_event_id = str((state.current_event or {}).get("eventId") or "")
+        if not canonical_event_id or get_event_by_id(canonical_event_id) is None:
+            reason = "reliable Action 必须绑定真实 canonical Event"
+            _record_block(reason)
+            return {
+                "action_type": canonical_action_type,
+                "status": "blocked",
+                "executed": False,
+                "reason": reason,
+                "error": reason,
+            }
+
+    # ``canonical_action_type`` is registry-normalized and therefore must map
+    # to the same stable key computed before the early safety gates.
+    idempotency_key = compute_action_idempotency_key(
+        state.workflow_run_id, config.node_id, canonical_action_type, semantic_version
+    )
+    event_id = str((state.current_event or {}).get("eventId") or "")
+    request_metadata = {
+        "executor": type(reliable_executor).__name__ if reliable_executor is not None else "legacy-dispatch",
+        "idempotencyKey": idempotency_key,
+        "semanticActionVersion": semantic_version,
+    }
     record = WorkflowActionRecord(
         action_id=action_id,
         run_id=state.workflow_run_id,
         node_id=config.node_id,
-        action_type=action_type,
+        event_id=event_id,
+        action_type=canonical_action_type,
         idempotency_key=idempotency_key,
-        params=action_params,
-        status=ActionStatus.EXECUTING,
+        semantic_action_version=semantic_version,
+        params=safe_params,
+        request_metadata=request_metadata,
+        reconciliation_supported=bool(
+            getattr(reliable_executor, "reconciliation_supported", False)
+        ),
+        status=ActionStatus.PENDING,
     )
 
     # ── C1: budget/dispatch 前 gate（identity + lease 未过期 + 非 CANCELLED）──
     _gate = _driver_gate()
     if _gate == "cancelled":
         state.add_audit_event("action_cancelled_before_dispatch", config.node_id, {"actionType": action_type})
+        _record_block("run cancelled before action")
         return _cancelled_result("run cancelled before action")
     if _gate == "lease_lost":
         state.add_audit_event("lease_lost", config.node_id, {"actionType": action_type})
         return _lease_lost_result()
 
-    # ── Phase17 Round2: budget durable reservation BEFORE dispatch ──
-    # ToolPolicy ALLOW 后、真正 dispatch 前：check → increment → persist → dispatch。
-    # 若 persist 失败或 budget 耗尽 → fail-closed，不 dispatch。
+    # A durable result is consulted before reserving another tool call.  This
+    # is important after restart and for duplicate client delivery: a known
+    # SUCCEEDED/UNKNOWN/RUNNING action must not consume retry budget or reach
+    # the provider merely because the same command was submitted again.
+    if repository:
+        existing = repository.get_action_record_by_idempotency_key(idempotency_key)
+        legacy_existing = (
+            repository.get_action_record_by_idempotency_key(legacy_idempotency_key)
+            if legacy_idempotency_key
+            and legacy_idempotency_key != idempotency_key
+            else None
+        )
+        if (
+            existing is not None
+            and legacy_existing is not None
+            and existing.action_id != legacy_existing.action_id
+        ):
+            _record_block("检测到重复的 legacy/versioned Action identity，禁止再次执行")
+            return {
+                "actionExecutionId": existing.action_id,
+                "action_type": canonical_action_type,
+                "status": "blocked",
+                "executed": False,
+                "reason": "duplicate semantic Action identity",
+                "error": "duplicate semantic Action identity",
+            }
+        if existing is None:
+            existing = legacy_existing
+        if existing is not None and existing.idempotency_key != idempotency_key:
+            # Preserve the exact identity already sent to an external provider
+            # by a pre-21.3 runtime.  Changing it during upgrade could create a
+            # second side effect or make reconciliation query the wrong key.
+            idempotency_key = existing.idempotency_key
+            record.idempotency_key = idempotency_key
+            record.request_metadata["idempotencyKey"] = idempotency_key
+        if existing is not None and (
+            existing.run_id != state.workflow_run_id
+            or existing.node_id != config.node_id
+            or (
+                reliable_executor is not None
+                and existing.event_id != event_id
+            )
+            or existing.action_type != canonical_action_type
+            or existing.semantic_action_version != semantic_version
+        ):
+            action_id = existing.action_id
+            _record_block("Action Execution durable identity mismatch")
+            return {
+                "action_id": existing.action_id,
+                "actionExecutionId": existing.action_id,
+                "action_type": canonical_action_type,
+                "status": "blocked",
+                "executed": False,
+                "reason": "Action Execution durable identity mismatch",
+                "error": "Action Execution durable identity mismatch",
+            }
+        if (
+            existing is not None
+            and existing.status != ActionStatus.PENDING
+            # Pre-21.3 actions retain their configured in-node retry behavior;
+            # reliable executors require the explicit FAILED → PENDING API.
+            and not (
+                reliable_executor is None
+                and existing.status == ActionStatus.FAILED
+            )
+        ):
+            if existing.status == ActionStatus.SUCCEEDED:
+                return {
+                    "action_id": existing.action_id,
+                    "actionExecutionId": existing.action_id,
+                    "action_type": canonical_action_type,
+                    "status": "skipped",
+                    "reason": "idempotent_skip",
+                    "previous_result": sanitize_public_value(existing.result),
+                }
+            if existing.status in {
+                ActionStatus.RUNNING,
+                ActionStatus.EXECUTING,
+                ActionStatus.UNKNOWN,
+            }:
+                return {
+                    "action_id": existing.action_id,
+                    "actionExecutionId": existing.action_id,
+                    "action_type": canonical_action_type,
+                    "status": (
+                        "unknown"
+                        if existing.status == ActionStatus.UNKNOWN
+                        else "in_flight"
+                    ),
+                    "executed": False,
+                    "reason": f"existing {existing.status.value} attempt",
+                    "externalReference": existing.external_reference or None,
+                }
+            return {
+                "action_id": existing.action_id,
+                "actionExecutionId": existing.action_id,
+                "action_type": canonical_action_type,
+                "status": "blocked",
+                "executed": False,
+                "reason": "explicit retry required",
+                "error": "explicit retry required",
+            }
+        if (
+            reliable_executor is not None
+            and durable_run is not None
+            and durable_run.status.value not in {"pending", "running"}
+        ):
+            _record_block(
+                f"Run 状态为 {durable_run.status.value}，禁止创建新的 Action 副作用"
+            )
+            return {
+                "actionExecutionId": action_id,
+                "action_type": canonical_action_type,
+                "status": "blocked",
+                "executed": False,
+                "reason": "Workflow Run 当前状态不允许执行新 Action",
+                "error": "Workflow Run 当前状态不允许执行新 Action",
+            }
+
+    # Budget is reserved before a durable claim; failure means no dispatch.
     if repository:
         from backend.planning.budget import reserve_tool_call_durable
         if not reserve_tool_call_durable(repository, state.workflow_run_id):
             state.add_audit_event("budget_exhausted", config.node_id, {
                 "actionType": action_type, "reason": "tool budget exhausted",
             })
+            _record_block("tool budget exhausted")
             return {
                 "action_type": action_type,
                 "status": "budget_exhausted",
@@ -320,12 +696,93 @@ async def execute_action(
                 "reason": "tool budget exhausted",
             }
 
-    # ── Phase17 Round3: persist EXECUTING record BEFORE dispatch ──
-    # action_id 即 dispatchAttemptId；EXECUTING = dispatch_started marker。
-    # marker 必须 durable persist；失败 → 不 dispatch（fail-closed）。
+    # Durable compare-and-set claim is the only path to the side effect.
     if repository:
         try:
-            repository.save_action_record(record)
+            if reliable_executor is None:
+                # Compatibility boundary for pre-21.3 actions.  Their tests and
+                # plugins hook save_action_record directly; the new reliable
+                # executors below use the stricter transactional claim API.
+                existing = repository.get_action_record_by_idempotency_key(idempotency_key)
+                if existing is not None:
+                    if existing.status == ActionStatus.SUCCEEDED:
+                        return {
+                            "action_id": existing.action_id,
+                            "actionExecutionId": existing.action_id,
+                            "action_type": canonical_action_type,
+                            "status": "skipped",
+                            "reason": "idempotent_skip",
+                            "previous_result": sanitize_public_value(existing.result),
+                        }
+                    if existing.status in {ActionStatus.RUNNING, ActionStatus.EXECUTING, ActionStatus.UNKNOWN}:
+                        return {
+                            "action_id": existing.action_id,
+                            "actionExecutionId": existing.action_id,
+                            "action_type": canonical_action_type,
+                            "status": "unknown" if existing.status == ActionStatus.UNKNOWN else "in_flight",
+                            "executed": False,
+                            "reason": f"existing {existing.status.value} attempt",
+                        }
+                record.status = ActionStatus.EXECUTING
+                record.attempt = max(1, int(existing.attempt or 0) + 1) if existing else 1
+                record.started_at = _utc_now_iso()
+                repository.save_action_record(record)
+                marker = repository.get_action_record_by_idempotency_key(idempotency_key)
+                if marker is None or marker.action_id != action_id:
+                    return {
+                        "action_id": marker.action_id if marker else "",
+                        "actionExecutionId": marker.action_id if marker else "",
+                        "action_type": canonical_action_type,
+                        "status": "in_flight",
+                        "executed": False,
+                        "reason": "idempotent_db_protect",
+                        "error": "existing execution owns marker",
+                    }
+                record = marker
+            else:
+                claim = repository.claim_action_execution(record)
+                marker = claim.get("record")
+                if not claim.get("claimed"):
+                    if claim.get("reason") == "run_cancelled":
+                        return _cancelled_result("run cancelled before action")
+                    if marker is None:
+                        return {
+                            "action_type": canonical_action_type,
+                            "status": "blocked",
+                            "executed": False,
+                            "reason": str(claim.get("reason") or "claim rejected"),
+                        }
+                    if marker.status == ActionStatus.SUCCEEDED:
+                        return {
+                            "action_id": marker.action_id,
+                            "actionExecutionId": marker.action_id,
+                            "action_type": canonical_action_type,
+                            "status": "skipped",
+                            "reason": "idempotent_skip",
+                            "previous_result": sanitize_public_value(marker.result),
+                        }
+                    if marker.status in {ActionStatus.RUNNING, ActionStatus.EXECUTING, ActionStatus.UNKNOWN}:
+                        return {
+                            "action_id": marker.action_id,
+                            "actionExecutionId": marker.action_id,
+                            "action_type": canonical_action_type,
+                            "status": "unknown" if marker.status == ActionStatus.UNKNOWN else "in_flight",
+                            "executed": False,
+                            "reason": f"existing {marker.status.value} attempt",
+                            "externalReference": marker.external_reference or None,
+                        }
+                    return {
+                        "action_id": marker.action_id,
+                        "actionExecutionId": marker.action_id,
+                        "action_type": canonical_action_type,
+                        "status": marker.status.value,
+                        "executed": False,
+                        "reason": "explicit retry required",
+                        "error": "explicit retry required",
+                    }
+                record = marker
+                action_id = record.action_id
+                idempotency_key = record.idempotency_key
         except Exception as e:
             state.add_audit_event("dispatch_marker_persist_failed", config.node_id, {
                 "actionType": action_type, "reason": str(e)[:200],
@@ -338,115 +795,242 @@ async def execute_action(
                 "error": str(e)[:200],  # 使 executor 判为 node 失败（可安全 retry，无外部 side effect）
             }
 
-    # ── C2: external dispatch 前 re-check（durable != CANCELLED 且 lease 未过期）──
+    # Re-check cancellation/fencing after the marker and immediately before dispatch.
     _gate = _driver_gate()
     if _gate == "cancelled":
-        # EXECUTING marker 已 persist，但 cancel 发生在真正 dispatch 前 → 终结为 known-not-dispatched
         state.add_audit_event("action_cancelled_before_dispatch", config.node_id, {"actionType": action_type})
-        _finalize_marker_cancelled()
+        if repository:
+            if reliable_executor is None:
+                record.status = ActionStatus.FAILED
+                record.result = {"cancelled": True, "dispatched": False}
+                record.error = "cancelled_before_dispatch"
+                record.completed_at = _utc_now_iso()
+                record.finished_at = record.completed_at
+                repository.save_action_record(record)
+            else:
+                repository.finalize_action_execution({
+                    "actionExecutionId": action_id,
+                    "attempt": record.attempt,
+                    "status": ActionStatus.CANCELLED.value,
+                    "result": {"cancelled": True, "dispatched": False},
+                    "error": "cancelled_before_dispatch",
+                    "finishedAt": _utc_now_iso(),
+                })
         return _cancelled_result("run cancelled before dispatch")
     if _gate == "lease_lost":
         state.add_audit_event("lease_lost", config.node_id, {"actionType": action_type})
         return _lease_lost_result()
 
-    # 执行具体动作
     result_data: Dict[str, Any] = {}
     error = ""
     status = ActionStatus.SUCCEEDED
+    external_reference = ""
+    retryable = False
+    reconciliation_supported = bool(record.reconciliation_supported)
+    reconciliation_message = ""
 
     try:
-        result_data = await _dispatch_action(action_type, action_params, state)
+        if reliable_executor is not None:
+            context = ActionExecutionContext(
+                action_execution_id=action_id,
+                workflow_run_id=state.workflow_run_id,
+                node_id=config.node_id,
+                event_id=event_id,
+                action_type=canonical_action_type,
+                idempotency_key=idempotency_key,
+                attempt=int(record.attempt or 1),
+                params=safe_params,
+                event=dict(state.current_event or {}),
+                risk=dict(risk),
+                repository=repository,
+            )
+            validation_error = reliable_executor.validate(context)
+            if validation_error:
+                execution_result = ActionExecutorResult(
+                    status=ActionStatus.FAILED,
+                    error=validation_error,
+                    retryable=False,
+                    reconciliation_supported=bool(reliable_executor.reconciliation_supported),
+                )
+            else:
+                execution_result = await reliable_executor.execute(context)
+            status = execution_result.status
+            result_data = execution_result.safe_metadata()
+            if execution_result.message:
+                result_data["message"] = sanitize_public_text(
+                    execution_result.message
+                )
+            error = sanitize_public_text(execution_result.error)[:500]
+            external_reference = sanitize_public_text(
+                execution_result.external_reference
+            )[:500]
+            retryable = bool(execution_result.retryable)
+            reconciliation_supported = bool(execution_result.reconciliation_supported)
+            reconciliation_message = sanitize_public_text(
+                execution_result.reconciliation_message
+            )[:500]
+        else:
+            result_data = await _dispatch_action(action_type, safe_params, state)
+    except asyncio.CancelledError:
+        status = ActionStatus.UNKNOWN
+        error = "execution cancelled after dispatch marker; external outcome unknown"
+        reconciliation_message = "reconciliation required before retry"
+        raise_after_finalize = True
+    except (asyncio.TimeoutError, TimeoutError):
+        status = ActionStatus.UNKNOWN
+        error = "provider timeout; external outcome unknown"
+        reconciliation_message = "reconciliation required before retry"
+        raise_after_finalize = False
     except Exception as e:
-        error = str(e)[:500]
-        status = ActionStatus.FAILED
+        error = sanitize_public_text(e)[:500]
         result_data = {}
-        state.record_error(config.node_id, f"action 执行失败: {error}")
+        if reliable_executor is not None:
+            # Once a durable dispatch marker exists, an executor/provider
+            # exception cannot prove that the side effect did not happen.
+            # Conservatively fence it as UNKNOWN; only reconciliation may
+            # later establish FAILED/retryable or SUCCEEDED.
+            status = ActionStatus.UNKNOWN
+            retryable = False
+            reconciliation_supported = bool(
+                getattr(reliable_executor, "reconciliation_supported", False)
+            )
+            reconciliation_message = (
+                "executor raised after dispatch marker; reconciliation required"
+            )
+            state.record_error(
+                config.node_id,
+                f"action 外部执行结果未知: {error}",
+            )
+        else:
+            status = ActionStatus.FAILED
+            state.record_error(config.node_id, f"action 执行失败: {error}")
+            retryable = True
+        raise_after_finalize = False
+    else:
+        raise_after_finalize = False
 
     # ── 工具失败语义（Section 17）：result 明确失败时不得标记 SUCCEEDED ──
     # _dispatch_action 对 notify/save 失败返回 {"sent": False}/{"saved": False}
     # 而非抛异常，因此必须在执行后重新判定，防止失败被记录成成功。
-    if status == ActionStatus.SUCCEEDED and classify_tool_result(result_data) == ToolExecutionStatus.FAILURE:
+    if reliable_executor is None and status == ActionStatus.SUCCEEDED and classify_tool_result(result_data) == ToolExecutionStatus.FAILURE:
         status = ActionStatus.FAILED
         if isinstance(result_data, dict):
             error = str(result_data.get("error", "工具返回失败结果"))[:500]
         else:
             error = "工具返回失败结果"
         state.record_error(config.node_id, f"action 执行失败: {error}")
+        retryable = True
 
-    # 更新动作记录
-    record.status = status
-    record.result = result_data
-    record.error = error
-    record.completed_at = record.created_at  # 简化时间戳
-
-    # 持久化（如果提供了 repository）
-    # DB 层有 UNIQUE(idempotency_key) 约束，提供数据库级别的幂等保护
+    finalization = {
+        "actionExecutionId": action_id,
+        "attempt": int(record.attempt or 1),
+        "status": status.value,
+        "result": sanitize_public_value(result_data),
+        "error": error,
+        "externalReference": external_reference,
+        "finishedAt": _utc_now_iso(),
+        "retryable": retryable,
+        "reconciliationSupported": reconciliation_supported,
+        "reconciliationMessage": reconciliation_message,
+    }
     if repository:
-        try:
-            repository.save_action_record(record)
-        except Exception as e:
-            # 检查是否为 IntegrityError（幂等键冲突）
-            err_str = str(e).lower()
-            if "unique" in err_str or "integrity" in err_str:
-                # 数据库级别幂等保护：重新读取已有记录
-                try:
-                    existing = repository.get_action_record_by_idempotency_key(
-                        idempotency_key
-                    )
-                    if existing:
-                        state.add_audit_event("action_idempotent_db_protect", config.node_id, {
-                            "actionType": action_type,
-                            "idempotencyKey": idempotency_key,
-                            "reason": "DB UNIQUE 约束触发，幂等跳过",
-                        })
-                        return {
-                            "action_id": existing.action_id,
-                            "action_type": action_type,
-                            "status": "skipped",
-                            "reason": "idempotent_db_protect",
-                            "previous_result": existing.result,
-                        }
-                except Exception:
-                    pass
-                # UNIQUE 冲突但读取失败 → 继续（幂等键仍存在，不重复执行）
-            else:
-                # 其他持久化错误 → fail-safe：external 已发生但 durable terminal result 丢失。
-                # EXECUTING marker 仍在 DB，HIGH_RISK 重启/恢复会识别 UNKNOWN_OUTCOME。
-                state.add_audit_event("action_result_persist_failed", config.node_id, {
-                    "actionType": action_type, "reason": str(e)[:200],
-                })
-                state.record_error(config.node_id, f"action result 持久化失败: {str(e)[:200]}")
+        if reliable_executor is None:
+            try:
+                record.status = status
+                record.result = sanitize_public_value(result_data)
+                record.error = error
+                record.completed_at = finalization["finishedAt"]
+                record.finished_at = finalization["finishedAt"]
+                record.external_reference = external_reference
+                record.retryable = retryable
+                record.reconciliation_supported = reconciliation_supported
+                record.reconciliation_message = reconciliation_message
+                repository.save_action_record(record)
+            except Exception as e:
                 return {
                     "action_id": action_id,
-                    "action_type": action_type,
+                    "actionExecutionId": action_id,
+                    "action_type": canonical_action_type,
+                    "status": "result_persist_failed",
+                    "error": f"action result 持久化失败: {str(e)[:200]}",
+                }
+        elif not defer_terminal:
+            try:
+                if not repository.finalize_action_execution(finalization):
+                    raise RuntimeError("action terminal compare-and-set failed")
+            except Exception as e:
+                state.add_audit_event("action_result_persist_failed", config.node_id, {
+                    "actionType": canonical_action_type, "reason": str(e)[:200],
+                })
+                return {
+                    "action_id": action_id,
+                    "actionExecutionId": action_id,
+                    "action_type": canonical_action_type,
                     "status": "result_persist_failed",
                     "error": f"action result 持久化失败: {str(e)[:200]}",
                 }
 
-    # 跟踪
-    state.action_record_ids.append(action_id)
+    if action_id not in state.action_record_ids:
+        state.action_record_ids.append(action_id)
     if isinstance(state.action_results, dict):
-        state.action_results[action_type] = {
-            "actionId": action_id,
+        state.action_results[canonical_action_type] = {
+            "actionExecutionId": action_id,
             "status": status.value,
-            "result": result_data,
+            "result": sanitize_public_value(result_data),
             "error": error,
+            "externalReference": external_reference or None,
         }
 
-    state.add_audit_event("action_executed", config.node_id, {
-        "actionType": action_type,
-        "actionId": action_id,
+    state.add_audit_event(f"action_{status.value}", config.node_id, {
+        "actionType": canonical_action_type,
+        "actionExecutionId": action_id,
+        "attempt": int(record.attempt or 1),
         "status": status.value,
         "idempotencyKey": idempotency_key,
     })
+    try:
+        from backend.observability.logging import log_runtime_event
+        log_runtime_event(
+            component="workflow.action",
+            operation=(
+                "action_execution_failed"
+                if status in {ActionStatus.FAILED, ActionStatus.UNKNOWN}
+                else "action_execution_completed"
+            ),
+            status=status.value,
+            event_id=event_id,
+            workflow_run_id=state.workflow_run_id,
+            action_execution_id=action_id,
+            actionType=canonical_action_type,
+            attempt=int(record.attempt or 1),
+            error=error or None,
+        )
+    except Exception:
+        # Observability must never change the action result or execution fence.
+        pass
 
-    return {
+    response = {
         "action_id": action_id,
-        "action_type": action_type,
+        "actionExecutionId": action_id,
+        "action_type": canonical_action_type,
+        "actionType": canonical_action_type,
+        "attempt": int(record.attempt or 1),
         "status": status.value,
-        "result": result_data,
+        "result": sanitize_public_value(result_data),
         "error": error,
+        "externalReference": external_reference or None,
+        "reconciliationSupported": reconciliation_supported,
+        "retryable": retryable,
     }
+    if defer_terminal and repository and reliable_executor is not None:
+        response["_actionFinalization"] = finalization
+    if raise_after_finalize:
+        # asyncio.wait_for cancellation must not erase the UNKNOWN marker.
+        if repository and defer_terminal:
+            repository.finalize_action_execution(finalization)
+            response.pop("_actionFinalization", None)
+        raise asyncio.CancelledError
+    return response
 
 
 async def _dispatch_action(
@@ -500,14 +1084,20 @@ async def _dispatch_action(
         # 持久化分析结果
         try:
             from backend.tools.db_tools import save_event_analysis
+            # ``save_event_analysis`` consumes the historical analyze-event
+            # envelope, not a flat event DTO.  Passing flat fields here used
+            # to replace an existing canonical row with empty event data on
+            # Workflow completion.  Preserve the authoritative event snapshot
+            # and let canonical lifecycle changes happen only through the
+            # executor's compare-and-set transition.
+            standard_event = dict(event)
             result_data = {
                 "eventId": event.get("eventId", f"evt_{state.workflow_run_id}"),
-                "eventType": event.get("eventType", ""),
-                "eventTypeCn": event.get("eventTypeCn", ""),
-                "roadName": event.get("roadName", ""),
+                "standardEvent": standard_event,
                 "riskScore": risk.get("riskScore", 0),
                 "riskLevel": risk.get("riskLevel", "低风险"),
-                "status": "待派单",
+                "status": event.get("status", "待派单"),
+                "report": getattr(state, "report", "") or "",
             }
             ok = save_event_analysis(result_data)
             return {"saved": bool(ok), "eventId": result_data.get("eventId", "")}

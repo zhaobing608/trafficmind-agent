@@ -347,13 +347,25 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(collab_db, "datetime", FixedDateTime)
 
     import backend.planning.models as planning_models
+    import backend.agent.collaboration.state as collaboration_state
+    import backend.case_memory.models as case_models
+    import backend.workflow.nodes.action as workflow_action_node
+    import backend.workflow.nodes.human_approval as workflow_approval_node
+    import backend.regional.repository as regional_repository_module
     import backend.workflow.executor as workflow_executor
     import backend.workflow.models as workflow_models
+    import backend.workflow.repository as workflow_repository_module
     import backend.workflow.state as workflow_state
 
+    monkeypatch.setattr(case_models, "datetime", FixedDateTime)
+    monkeypatch.setattr(collaboration_state, "datetime", FixedDateTime)
+    monkeypatch.setattr(regional_repository_module, "datetime", FixedDateTime)
     monkeypatch.setattr(planning_models, "datetime", FixedDateTime)
+    monkeypatch.setattr(workflow_action_node, "datetime", FixedDateTime)
+    monkeypatch.setattr(workflow_approval_node, "datetime", FixedDateTime)
     monkeypatch.setattr(workflow_executor, "datetime", FixedDateTime)
     monkeypatch.setattr(workflow_models, "datetime", FixedDateTime)
+    monkeypatch.setattr(workflow_repository_module, "datetime", FixedDateTime)
     monkeypatch.setattr(workflow_state, "datetime", FixedDateTime)
     chat_db.reset_initialized()
     db_tools.init_db()
@@ -688,9 +700,14 @@ def test_qiantang_g3b_eight_seed_system_closure(app_client, isolated, monkeypatc
         assert terminal_run.state["currentEvent"]["eventId"] == seed["eventId"]
         assert terminal_run.state.get("simulationRefs", {}) == {}
 
+        automatically_projected = isolated["caseRepo"].get_case_by_source_workflow_run_id(
+            workflow_run_id
+        )
+        assert automatically_projected is not None
         build_result = service.build_from_workflow_run(workflow_run_id)
         case = build_result.case
-        assert build_result.created is True
+        assert build_result.created is False
+        assert case.case_id == automatically_projected.case_id
         assert case.event_id == seed["eventId"]
         assert case.source_workflow_run_id == workflow_run_id
         assert case.source_plan_id == plan_body["planId"]

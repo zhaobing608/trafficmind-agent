@@ -44,6 +44,34 @@ def _f(type_name: str, required: bool, description: str = "") -> Dict[str, Any]:
 
 # businessParamSchema：每个 planner-eligible action 的 business 参数 schema
 PLANNER_PARAM_SCHEMAS: Dict[str, Dict[str, Any]] = {
+    # Phase 21.3 reliable actions.  Only business parameters cross the
+    # Agent → Plan boundary; credentials and runtime identity fields remain
+    # server-owned and are removed by FORBIDDEN_PARAM_KEYS / schema filtering.
+    "update_event_status": {
+        "description": "将 canonical Event 推进到合法的目标状态",
+        "fields": {
+            "status": _f("str", True, "目标 Event 状态"),
+        },
+        "required": ["status"],
+    },
+    "create_dispatch_task": {
+        "description": "创建幂等的内部处置任务",
+        "fields": {
+            "assignee": _f("str", False, "处置责任人或单位"),
+            "target": _f("str", False, "处置目标"),
+            "instruction": _f("str", True, "处置指令"),
+        },
+        "required": ["instruction"],
+    },
+    "send_notification": {
+        "description": "通过服务端 NotificationProvider 发送幂等通知",
+        "fields": {
+            "channel": _f("str", False, "服务端允许的通知通道"),
+            "target": _f("str", True, "通知目标"),
+            "message": _f("str", True, "通知内容"),
+        },
+        "required": ["target", "message"],
+    },
     # 通知类：无 business 参数（channel/内容由 system/event 上下文决定）
     "notify_wechat": {
         "description": "企业微信通知（高风险事件），无额外 business 参数",

@@ -1263,7 +1263,16 @@ class TestPhase94Integration:
     def test_legacy_analyze_with_session(self):
         r = client.post("/chat/sessions", json={"mode": "collaboration"})
         sid = r.json()["sessionId"]
-        body = {"eventId": "E_t1", "eventType": "congestion", "roadName": "测试", "direction": "东",
+        ingest = client.post("/events/ingest", json={
+            "source": "test-suite",
+            "sourceEventId": f"legacy-analyze-{sid}",
+            "event": {
+                "eventType": "congestion", "roadName": "测试", "direction": "东",
+                "avgSpeed": 8.0, "queueLength": 200, "duration": 600,
+            },
+        })
+        assert ingest.status_code == 200
+        body = {"eventId": ingest.json()["eventId"], "eventType": "congestion", "roadName": "测试", "direction": "东",
                 "avgSpeed": 8.0, "queueLength": 200, "duration": 600, "sessionId": sid}
         rt = client.post("/agent/routed_analyze/stream", json=body)
         assert rt.status_code == 200  # SSE stream starts

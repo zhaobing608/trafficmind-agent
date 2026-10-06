@@ -55,8 +55,15 @@ class RunDriver:
     async def start(self) -> None:
         if self._running:
             return
+        # Repair action/run crash windows before polling executable work.
+        # This scans all Runs (including direct/non-driver and CANCELLED) but
+        # never calls an executor or repeats a side effect.
+        self._repo.recover_action_runtime_invariants()
         self._running = True
-        self._stop_event.clear()
+        # TestClient and embedded ASGI hosts may start the same process-level
+        # singleton on a fresh event loop.  asyncio.Event is loop-bound after
+        # its first wait, so create a new lifecycle primitive per start.
+        self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(self._poll_loop())
         print(f"[RunDriver] 启动，owner={self._owner}，poll={self._poll_interval}s")
 
@@ -71,6 +78,8 @@ class RunDriver:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            finally:
+                self._task = None
         print("[RunDriver] 已停止")
 
     async def _poll_loop(self) -> None:
@@ -224,6 +233,13 @@ class RunDriver:
         )
         from backend.planning.continuation import PlanningContinuationCoordinator
 
+        # Durable runtime truth changes before the observational projection:
+        # stale dispatch is UNKNOWN and the Workflow is PAUSED.  It must never
+        # remain RUNNING or be auto-replayed after restart.
+        self._repo.mark_running_action_unknown_and_pause(
+            unknown.get("actionId", ""),
+            reason="runtime restarted after dispatch; external outcome unknown",
+        )
         coord = PlanningContinuationCoordinator(self._repo)
         obs = Observation(
             observationId=generate_observation_id(run.run_id),
@@ -284,12 +300,7 @@ class RunDriver:
         return lineage.rootRunId or run.run_id
 
     def _emit_recovery_event(self, run_id: str, event_type: str, payload: Dict[str, Any]) -> None:
-        from backend.workflow.models import WorkflowEvent
-        evt = WorkflowEvent(
-            event_id=f"wfevent_{event_type}_{payload.get('recoveryAttemptId', uuid.uuid4().hex)}",
-            run_id=run_id, event_type=event_type, payload=payload, sequence=0,
-        )
-        self._repo.save_event(evt)
+        self._repo.append_event(run_id, event_type, payload=payload)
 
 
 # ── 全局单例 ──────────────────────────────────────────────────────────────

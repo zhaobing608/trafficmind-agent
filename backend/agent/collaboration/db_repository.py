@@ -3,9 +3,13 @@ SQLite 协作持久化 — Phase 9.3
 5 tables: collaboration_runs/tasks/messages/conflicts/events
 """
 import sqlite3, json, os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from backend.config import DB_PATH
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def get_conn():
@@ -66,6 +70,11 @@ def init_collaboration_tables():
         CREATE INDEX IF NOT EXISTS idx_collab_msgs_run ON collaboration_messages(run_id);
         CREATE INDEX IF NOT EXISTS idx_collab_tasks_run ON collaboration_tasks(run_id);
         CREATE INDEX IF NOT EXISTS idx_collab_events_run ON collaboration_events(run_id);
+        CREATE INDEX IF NOT EXISTS idx_collab_events_run_sequence
+            ON collaboration_events(run_id, sequence_number);
+        CREATE INDEX IF NOT EXISTS idx_collab_runs_event_id
+            ON collaboration_runs(json_extract(normalized_event, '$.eventId'))
+            WHERE json_valid(normalized_event);
     """)
     conn.commit(); conn.close()
 
@@ -75,7 +84,24 @@ def init_collaboration_tables():
 class SQLiteCollaborationRepository:
     def save_run(self, state):
         init_collaboration_tables()
-        conn = get_conn(); now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        conn = get_conn(); now = _utc_now_iso()
+        def _json_value(value, default):
+            if isinstance(value, str):
+                try:
+                    return json.loads(value)
+                except Exception:
+                    return default
+            return default if value is None else value
+
+        normalized_event = _json_value(state.get("normalized_event", {}), {})
+        selected_agents = _json_value(state.get("selected_agents", []), [])
+        skipped_agents = _json_value(state.get("skipped_agents", []), [])
+        failed_agents = _json_value(state.get("failed_agents", []), [])
+        budget_usage = _json_value(state.get("budget_usage", {}), {})
+        raw_final_decision = state.get("final_decision", "")
+        final_decision = _json_value(raw_final_decision, raw_final_decision)
+        previous_run_context = _json_value(state.get("previous_run_context"), None)
+        grounding_context = _json_value(state.get("grounding_context", {}), {})
         # Ensure previous_run_context column exists (non-destructive migration)
         try:
             conn.execute("ALTER TABLE collaboration_runs ADD COLUMN previous_run_context TEXT DEFAULT '{}'")
@@ -95,15 +121,52 @@ class SQLiteCollaborationRepository:
         """,
             (state["run_id"], state.get("session_id",""), state.get("trace_id",""),
              state["status"], state.get("protocol_version","1.0"),
-             json.dumps(state.get("normalized_event",{}), ensure_ascii=False),
-             json.dumps(state.get("selected_agents",[]), ensure_ascii=False),
-             json.dumps(state.get("skipped_agents",[]), ensure_ascii=False),
-             json.dumps(state.get("failed_agents",[]), ensure_ascii=False),
-             json.dumps(state.get("budget_usage",{}), ensure_ascii=False),
-             json.dumps(state.get("final_decision",""), ensure_ascii=False),
+             json.dumps(normalized_event, ensure_ascii=False),
+             json.dumps(selected_agents, ensure_ascii=False),
+             json.dumps(skipped_agents, ensure_ascii=False),
+             json.dumps(failed_agents, ensure_ascii=False),
+             json.dumps(budget_usage, ensure_ascii=False),
+             json.dumps(final_decision, ensure_ascii=False),
              state.get("started_at",""), now, state.get("completed_at",""),
-             json.dumps(state.get("previous_run_context", None), ensure_ascii=False),
-             json.dumps(state.get("grounding_context", {}), ensure_ascii=False)))
+             json.dumps(previous_run_context, ensure_ascii=False),
+             json.dumps(grounding_context, ensure_ascii=False)))
+        # Canonical Agent completion and event lifecycle advancement share the
+        # same SQLite transaction.  A completed live Agent run therefore cannot
+        # be durable while its canonical event is left behind in 待研判.  Replay
+        # runs are analysis-only and never mutate the original event lifecycle.
+        if (
+            state.get("status") in ("completed", "partial_success")
+            and isinstance(normalized_event, dict)
+            and normalized_event.get("runKind", "live") != "replay"
+            and normalized_event.get("actionExecutionAllowed", True) is not False
+        ):
+            event_id = str(
+                normalized_event.get("eventId")
+                or normalized_event.get("event_id")
+                or ""
+            ).strip()
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_records'"
+            ).fetchone()
+            if event_id and table_exists:
+                advanced = conn.execute(
+                    """UPDATE event_records SET status='待派单', updatedAt=?
+                       WHERE eventId=? AND status='待研判'""",
+                    (now, event_id),
+                )
+                lifecycle_exists = conn.execute(
+                    """SELECT 1 FROM sqlite_master
+                       WHERE type='table' AND name='event_lifecycle_audit'"""
+                ).fetchone()
+                if advanced.rowcount == 1 and lifecycle_exists:
+                    conn.execute(
+                        """INSERT INTO event_lifecycle_audit (
+                               event_id, event_type, previous_status, status,
+                               actor, created_at
+                           ) VALUES (?, 'event_status_updated', '待研判', '待派单',
+                                     'agent_runtime', ?)""",
+                        (event_id, now),
+                    )
         conn.commit(); conn.close()
 
     def get_run(self, run_id: str) -> Optional[Dict]:
@@ -123,7 +186,7 @@ class SQLiteCollaborationRepository:
                  msg.get("phase",""), msg.get("attempt",1),
                  json.dumps(msg.get("payload",{}), ensure_ascii=False),
                  json.dumps(msg.get("evidence_refs",[]), ensure_ascii=False),
-                 msg.get("created_at",datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))))
+                 msg.get("created_at", _utc_now_iso())))
             conn.commit()
         except sqlite3.IntegrityError: pass
         finally: conn.close()
@@ -134,7 +197,7 @@ class SQLiteCollaborationRepository:
         conn.close(); return [dict(r) for r in rows]
 
     def save_task(self, run_id: str, task_dict: Dict):
-        init_collaboration_tables(); conn = get_conn(); now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        init_collaboration_tables(); conn = get_conn(); now = _utc_now_iso()
         conn.execute("""INSERT OR REPLACE INTO collaboration_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (task_dict.get("task_id",""), run_id, task_dict.get("agent_name",""),
              task_dict.get("task_type",""), task_dict.get("status","pending"),
@@ -185,9 +248,8 @@ class SQLiteCollaborationRepository:
         rows = conn.execute(
             """
             SELECT * FROM collaboration_runs
-            WHERE CASE WHEN json_valid(normalized_event)
-                THEN json_extract(normalized_event, '$.eventId')
-            END = ?
+            WHERE json_valid(normalized_event)
+              AND json_extract(normalized_event, '$.eventId') = ?
             ORDER BY updated_at DESC, started_at DESC, run_id DESC
             LIMIT ? OFFSET ?
             """,
@@ -205,9 +267,8 @@ class SQLiteCollaborationRepository:
         row = conn.execute(
             """
             SELECT COUNT(*) AS c FROM collaboration_runs
-            WHERE CASE WHEN json_valid(normalized_event)
-                THEN json_extract(normalized_event, '$.eventId')
-            END = ?
+            WHERE json_valid(normalized_event)
+              AND json_extract(normalized_event, '$.eventId') = ?
             """,
             (event_id,),
         ).fetchone()
@@ -223,7 +284,7 @@ class SQLiteCollaborationRepository:
              conflict.get("severity","low"), conflict.get("status","open"),
              conflict.get("resolution",""), conflict.get("resolved_by",""),
              int(conflict.get("requires_human_review", False)),
-             conflict.get("created_at", datetime.now().strftime("%Y-%m-%dT%H:%M:%S")),
+             conflict.get("created_at", _utc_now_iso()),
              conflict.get("resolved_at","")))
         conn.commit(); conn.close()
 
@@ -234,9 +295,11 @@ class SQLiteCollaborationRepository:
 
     def save_event(self, run_id: str, event: Dict, seq: int):
         init_collaboration_tables(); conn = get_conn()
-        conn.execute("""INSERT OR REPLACE INTO collaboration_events VALUES (?,?,?,?,?,?)""",
+        # Audit events are immutable.  A replay of the same identity is
+        # idempotent and must never overwrite the first durable fact.
+        conn.execute("""INSERT OR IGNORE INTO collaboration_events VALUES (?,?,?,?,?,?)""",
             (event.get("event_id",f"evt_{seq}"), run_id, event.get("event_type",""),
-             json.dumps(event, ensure_ascii=False), seq, datetime.now().strftime("%Y-%m-%dT%H:%M:%S")))
+             json.dumps(event, ensure_ascii=False), seq, _utc_now_iso()))
         conn.commit(); conn.close()
 
     def list_events(self, run_id: str) -> List[Dict]:

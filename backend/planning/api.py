@@ -353,6 +353,15 @@ async def run_plan(plan_id: str, body: PlanRunRequest):
     if plan is None:
         raise HTTPException(status_code=400, detail="definition 缺少 plan 元数据")
 
+    if (plan.metadata or {}).get("actionExecutionAllowed") is False:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "replay_execution_blocked",
+                "message": "该方案来自安全 replay run，默认禁止启动 Action Workflow",
+            },
+        )
+
     # revalidate 安全条件（ToolPolicy / 校验仍唯一权威）
     issues = validate_plan(plan)
     if has_errors(issues):
@@ -659,8 +668,6 @@ def _record_plan_lifecycle_events(run_id: str) -> None:
     """补写 plan_started + plan_completed/plan_failed 事件（run 已持久化后）。"""
     from datetime import datetime, timezone
 
-    from backend.workflow.models import WorkflowEvent
-
     run = _repo.get_run(run_id)
     if run is None:
         return
@@ -668,18 +675,13 @@ def _record_plan_lifecycle_events(run_id: str) -> None:
     def _now() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    existing = _repo.list_events(run_id)
-    seq = len(existing)
-
-    start_evt = WorkflowEvent(
+    _repo.append_event(
+        run_id,
+        "plan_started",
         event_id=f"wfevent_plan_{run_id}_start",
-        run_id=run_id,
-        event_type="plan_started",
         payload={"runId": run_id, "startedAt": run.started_at or ""},
-        sequence=seq,
         created_at=run.started_at or _now(),
     )
-    _repo.save_event(start_evt)
 
     evt_type = {
         "completed": "plan_completed",
@@ -688,11 +690,9 @@ def _record_plan_lifecycle_events(run_id: str) -> None:
         "cancelled": "plan_cancelled",
     }.get(run.status.value)
     if evt_type:
-        end_evt = WorkflowEvent(
+        _repo.append_event(
+            run_id,
+            evt_type,
             event_id=f"wfevent_plan_{run_id}_end",
-            run_id=run_id,
-            event_type=evt_type,
             payload={"runId": run_id, "status": run.status.value},
-            sequence=seq + 1,
         )
-        _repo.save_event(end_evt)

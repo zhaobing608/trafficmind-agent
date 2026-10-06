@@ -351,14 +351,11 @@ def _from_dict(d: Dict[str, Any]) -> ExecutionAssessment:
 def _save_assessment_event(repo, run_id: str, key: str, result: ExecutionAssessment) -> None:
     """audit event（sanitized，不存 raw prompt/response/CoT）。"""
     try:
-        from backend.workflow.models import WorkflowEvent
-        evt = WorkflowEvent(
+        repo.append_event(
+            run_id,
+            "assessment_completed",
             event_id=f"wfevent_assessment_{key[:40]}",
-            run_id=run_id,
-            event_type="assessment_completed",
             payload=result.to_dict(),
-            sequence=0,
         )
-        repo.save_event(evt)
     except Exception:
         pass

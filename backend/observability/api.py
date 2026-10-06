@@ -6,7 +6,7 @@ GET /observability/workflows/{run_id}
 from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from backend.workflow.repository import SQLiteWorkflowRepository
 from backend.observability.models import (
     WorkflowObservability, NodeObservation, AgentObservation,
@@ -15,6 +15,8 @@ from backend.observability.models import (
 )
 
 router = APIRouter(prefix="/observability", tags=["Observability V1"])
+operations_router = APIRouter(prefix="/operations", tags=["Runtime Operations"])
+event_trace_router = APIRouter(prefix="/events", tags=["Execution Trace"])
 _repo = SQLiteWorkflowRepository()
 
 
@@ -232,3 +234,198 @@ async def get_workflow_observability(run_id: str):
 
     from dataclasses import asdict
     return asdict(obs)
+
+
+# ---------------------------------------------------------------------------
+# Phase 21.4 — unified trace, audit, health, and operational alerts
+# ---------------------------------------------------------------------------
+
+
+def _audit_filters(
+    *,
+    limit: int,
+    offset: int,
+    event_type: Optional[str],
+    status: Optional[str],
+    from_time: Optional[str],
+    to_time: Optional[str],
+) -> Dict[str, Any]:
+    return {
+        "limit": limit,
+        "offset": offset,
+        "event_type": event_type or "",
+        "status": status or "",
+        "from_time": from_time or "",
+        "to_time": to_time or "",
+    }
+
+
+def _trace_page(limit: int, offset: int) -> Dict[str, int]:
+    return {"timeline_limit": limit, "timeline_offset": offset}
+
+
+@operations_router.get("/summary", summary="Runtime health summary")
+async def get_operations_summary():
+    from backend.observability.operations import runtime_summary
+    return runtime_summary()
+
+
+@operations_router.post("/alerts/scan", summary="Run one idempotent alert scan")
+async def scan_operations_alerts():
+    from backend.observability.operations import scan_operational_alerts
+    return scan_operational_alerts()
+
+
+@operations_router.get("/alerts", summary="List durable operational alerts")
+async def get_operations_alerts(
+    status: Optional[str] = Query("active"),
+    alertType: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    eventId: Optional[str] = Query(None),
+    workflowRunId: Optional[str] = Query(None),
+    actionExecutionId: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    from backend.observability.operations import (
+        ALERT_TYPES, list_operational_alerts,
+    )
+    if status and status not in {"active", "resolved"}:
+        raise HTTPException(status_code=400, detail="status must be active or resolved")
+    if alertType and alertType not in ALERT_TYPES:
+        raise HTTPException(status_code=400, detail="unsupported operational alert type")
+    return list_operational_alerts(
+        status=status or "", alert_type=alertType or "",
+        severity=severity or "", event_id=eventId or "",
+        workflow_run_id=workflowRunId or "",
+        action_execution_id=actionExecutionId or "",
+        limit=limit, offset=offset,
+    )
+
+
+@event_trace_router.get("/{event_id}/trace", summary="Unified Event execution trace")
+async def get_event_execution_trace(
+    event_id: str,
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    from backend.observability.operations import build_event_trace
+    trace = build_event_trace(event_id, **_trace_page(limit, offset))
+    if trace is None:
+        raise HTTPException(status_code=404, detail=f"Event '{event_id}' 不存在")
+    return trace
+
+
+@operations_router.get(
+    "/workflows/{run_id}/trace", summary="Reverse Workflow Run to Event trace"
+)
+async def get_workflow_event_trace(
+    run_id: str,
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    from backend.observability.operations import TraceIntegrityError, trace_for_workflow
+    try:
+        trace = trace_for_workflow(run_id, **_trace_page(limit, offset))
+    except TraceIntegrityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if trace is None:
+        raise HTTPException(status_code=404, detail="Workflow Run or Event relation not found")
+    return trace
+
+
+@operations_router.get(
+    "/actions/{action_execution_id}/trace",
+    summary="Reverse Action Execution to Event trace",
+)
+async def get_action_event_trace(
+    action_execution_id: str,
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    from backend.observability.operations import TraceIntegrityError, trace_for_action
+    try:
+        trace = trace_for_action(
+            action_execution_id, **_trace_page(limit, offset)
+        )
+    except TraceIntegrityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if trace is None:
+        raise HTTPException(status_code=404, detail="Action Execution or Event relation not found")
+    return trace
+
+
+@operations_router.get("/audit/events/{event_id}", summary="Query Event audit timeline")
+async def get_event_audit(
+    event_id: str,
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    eventType: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    from_time: Optional[str] = Query(None, alias="from"),
+    to_time: Optional[str] = Query(None, alias="to"),
+):
+    from backend.observability.operations import query_event_audit
+    result = query_event_audit(
+        event_id,
+        **_audit_filters(
+            limit=limit, offset=offset, event_type=eventType, status=status,
+            from_time=from_time, to_time=to_time,
+        ),
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Event '{event_id}' 不存在")
+    return result
+
+
+@operations_router.get(
+    "/audit/workflows/{run_id}", summary="Query Workflow runtime audit"
+)
+async def get_workflow_audit(
+    run_id: str,
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    eventType: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    from_time: Optional[str] = Query(None, alias="from"),
+    to_time: Optional[str] = Query(None, alias="to"),
+):
+    from backend.observability.operations import query_workflow_audit
+    result = query_workflow_audit(
+        run_id,
+        **_audit_filters(
+            limit=limit, offset=offset, event_type=eventType, status=status,
+            from_time=from_time, to_time=to_time,
+        ),
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Workflow Run '{run_id}' 不存在")
+    return result
+
+
+@operations_router.get(
+    "/audit/actions/{action_execution_id}", summary="Query Action attempt audit"
+)
+async def get_action_audit(
+    action_execution_id: str,
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    eventType: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    from_time: Optional[str] = Query(None, alias="from"),
+    to_time: Optional[str] = Query(None, alias="to"),
+):
+    from backend.observability.operations import query_action_audit
+    result = query_action_audit(
+        action_execution_id,
+        **_audit_filters(
+            limit=limit, offset=offset, event_type=eventType, status=status,
+            from_time=from_time, to_time=to_time,
+        ),
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Action Execution '{action_execution_id}' 不存在",
+        )
+    return result

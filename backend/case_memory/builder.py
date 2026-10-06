@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.agent.collaboration.db_repository import SQLiteCollaborationRepository
 from backend.case_memory.models import (
     CaseMemoryError,
     CaseMemoryQuality,
+    EventOutcome,
+    FeedbackEffectiveness,
+    FeedbackLifecycle,
     TrafficCaseMemory,
+    TrafficEventFeedback,
     build_case_id,
+    utc_now_iso,
 )
+from backend.case_memory.repository import SQLiteCaseMemoryRepository
 from backend.planning.agent_planning_adapter import _extract_agent_outputs
 from backend.planning.models import Plan
 from backend.regional.repository import SQLiteRegionalRepository
@@ -24,6 +31,7 @@ from backend.workflow.models import (
     WorkflowRun,
 )
 from backend.workflow.repository import SQLiteWorkflowRepository
+from backend.workflow.action_execution import sanitize_public_text, sanitize_public_value
 
 
 class TrafficCaseBuilder:
@@ -33,10 +41,12 @@ class TrafficCaseBuilder:
         workflow_repo: Optional[SQLiteWorkflowRepository] = None,
         regional_repo: Optional[SQLiteRegionalRepository] = None,
         collaboration_repo: Optional[SQLiteCollaborationRepository] = None,
+        feedback_repository: Optional[SQLiteCaseMemoryRepository] = None,
     ):
         self.workflow_repo = workflow_repo or SQLiteWorkflowRepository()
         self.regional_repo = regional_repo or SQLiteRegionalRepository()
         self.collaboration_repo = collaboration_repo or SQLiteCollaborationRepository()
+        self.feedback_repository = feedback_repository or SQLiteCaseMemoryRepository()
 
     def build_from_workflow_run(self, run_id: str) -> TrafficCaseMemory:
         run = self.workflow_repo.get_run(run_id)
@@ -114,18 +124,76 @@ class TrafficCaseBuilder:
 
         approvals = self.workflow_repo.list_approvals(run.run_id)
         action_records = self.workflow_repo.list_action_records(run.run_id)
+        feedback = self.feedback_repository.get_feedback(event_id, run.run_id)
         plan_facts = _build_plan_facts(plan, run, self.workflow_repo) if plan else {}
         agent_facts = _build_agent_facts(collaboration_run, tasks) if collaboration_run else {}
         human_decisions = _build_human_decisions(approvals)
-        workflow_outcome = _build_workflow_outcome(run, approvals, action_records)
+        recommendation_feedback = _build_recommendation_feedback(
+            run, plan_facts, approvals, action_records
+        )
+        action_feedback = _build_action_feedback(
+            plan_facts,
+            approvals,
+            action_records,
+            feedback,
+            self.workflow_repo,
+        )
+        event_outcome = _build_event_outcome(
+            run, event_snapshot, action_records, feedback
+        )
+        workflow_outcome = _build_workflow_outcome(
+            run, approvals, action_records, feedback
+        )
         lessons = _build_lessons(run, human_decisions, action_records, agent_facts, plan_facts)
 
         quality = _quality_status(
             run=run,
-            plan_facts=plan_facts,
-            agent_facts=agent_facts,
-            human_decisions=human_decisions,
+            feedback=feedback,
+            event_outcome=event_outcome,
             action_records=action_records,
+        )
+        system_fact_horizons = [
+            _source_fact_horizon([event_snapshot.get("updatedAt")]),
+            _source_fact_horizon([
+                binding.get("updatedAt"),
+                binding.get("resolvedAt"),
+                binding.get("createdAt"),
+            ]),
+            _source_fact_horizon([
+                run.completed_at,
+                run.updated_at,
+                run.started_at,
+            ]),
+        ]
+        if plan:
+            system_fact_horizons.append(
+                _source_fact_horizon([plan_facts.get("latestVersionCreatedAt")])
+            )
+        if collaboration_run:
+            system_fact_horizons.append(_source_fact_horizon([
+                collaboration_run.get("updated_at"),
+                collaboration_run.get("completed_at"),
+                collaboration_run.get("started_at"),
+            ]))
+        system_fact_horizons.extend(
+            _source_fact_horizon([
+                task.get("started_at"),
+                task.get("completed_at"),
+            ])
+            for task in tasks
+        )
+        system_fact_horizons.extend(
+            _source_fact_horizon([approval.decided_at, approval.created_at])
+            for approval in approvals
+        )
+        system_fact_horizons.extend(
+            _source_fact_horizon([
+                record.last_reconciled_at,
+                record.finished_at,
+                record.completed_at,
+                record.created_at,
+            ])
+            for record in action_records
         )
         case = TrafficCaseMemory(
             case_id=build_case_id(run.run_id),
@@ -145,6 +213,17 @@ class TrafficCaseBuilder:
             plan_facts=plan_facts,
             human_decisions=human_decisions,
             workflow_outcome=workflow_outcome,
+            recommendation_feedback=recommendation_feedback,
+            action_feedback=action_feedback,
+            event_outcome=event_outcome,
+            feedback_lifecycle=(
+                feedback.lifecycle if feedback else FeedbackLifecycle.PENDING
+            ),
+            feedback_updated_at=feedback.updated_at if feedback else None,
+            feedback_revision=feedback.revision if feedback else None,
+            system_updated_at=(
+                _latest_timestamp(system_fact_horizons) or utc_now_iso()
+            ),
             lessons=lessons,
             generated_summary=_build_generated_summary(event_snapshot, run),
             started_at=run.started_at or None,
@@ -170,6 +249,8 @@ class TrafficCaseBuilder:
                 "rawTranscriptStored": False,
                 "structuredFactsAuthoritative": True,
                 "businessOutcomeInferred": False,
+                "feedbackId": feedback.feedback_id if feedback else None,
+                "feedbackSource": "traffic_event_feedback" if feedback else None,
             },
         )
         return case
@@ -437,7 +518,9 @@ def _build_plan_facts(
     run: WorkflowRun,
     workflow_repo: SQLiteWorkflowRepository,
 ) -> Dict[str, Any]:
-    latest_version = workflow_repo.get_latest_version_number(plan.planId)
+    versions = workflow_repo.list_definition_versions(plan.planId)
+    latest_version = versions[0].version if versions else plan.version
+    latest_version_created_at = versions[0].created_at if versions else plan.updatedAt
     replan_count = max(0, latest_version - 1)
     metadata = plan.metadata if isinstance(plan.metadata, dict) else {}
     return {
@@ -450,6 +533,7 @@ def _build_plan_facts(
         "version": plan.version,
         "workflowVersion": run.version,
         "latestVersion": latest_version or plan.version,
+        "latestVersionCreatedAt": latest_version_created_at,
         "replanCount": replan_count,
         "stepCount": len(plan.steps),
         "steps": [
@@ -463,6 +547,12 @@ def _build_plan_facts(
                 "approvalRequired": bool(step.approvalRequired),
                 "riskLevel": step.riskLevel,
                 "expectedOutcome": step.expectedOutcome,
+                "params": _compact_json(
+                    _redact_sensitive(
+                        dict((step.metadata or {}).get("paramsTemplate") or {})
+                    ),
+                    max_items=20,
+                ),
                 "evidenceRefs": _compact_json(step.evidenceRefs, max_items=10),
             }
             for step in plan.steps
@@ -479,14 +569,27 @@ def _build_plan_facts(
 def _build_human_decisions(approvals: List[WorkflowApproval]) -> List[Dict[str, Any]]:
     decisions: List[Dict[str, Any]] = []
     for approval in approvals:
+        final_actions = (
+            approval.edited_actions
+            if approval.decision == ApprovalDecision.EDITED
+            else approval.proposed_actions
+            if approval.decision == ApprovalDecision.APPROVED
+            else []
+        )
         decisions.append({
             "approvalId": approval.approval_id,
             "nodeId": approval.node_id,
             "decision": approval.decision.value,
             "reviewer": approval.reviewer,
             "comment": _short_text(approval.comment),
+            "reasonCode": approval.reason_code.value,
             "proposedActions": [_compact_action(item) for item in approval.proposed_actions],
             "editedActions": [_compact_action(item) for item in approval.edited_actions],
+            "finalActions": [_compact_action(item) for item in final_actions],
+            "modifications": _structured_action_diff(
+                approval.proposed_actions,
+                final_actions,
+            ),
             "editedActionCount": len(approval.edited_actions),
             "manualAdjustment": bool(approval.edited_actions),
             "createdAt": approval.created_at,
@@ -499,6 +602,7 @@ def _build_workflow_outcome(
     run: WorkflowRun,
     approvals: List[WorkflowApproval],
     action_records: List[WorkflowActionRecord],
+    feedback: Optional[TrafficEventFeedback] = None,
 ) -> Dict[str, Any]:
     action_status_counts: Dict[str, int] = {}
     for record in action_records:
@@ -525,6 +629,10 @@ def _build_workflow_outcome(
                 "nodeId": record.node_id,
                 "actionType": record.action_type,
                 "status": record.status.value,
+                "attempt": int(record.attempt or 0),
+                "retryCount": max(0, int(record.attempt or 0) - 1),
+                "reconciliationAttempts": int(record.reconciliation_attempts or 0),
+                "lastReconciledAt": record.last_reconciled_at or None,
                 "error": _short_text(record.error),
                 "result": _compact_json(record.result, max_items=20),
                 "createdAt": record.created_at,
@@ -539,9 +647,359 @@ def _build_workflow_outcome(
             if isinstance(item, dict)
         ],
         "businessOutcome": {
-            "status": "unknown_without_external_evidence",
-            "reason": "workflow terminal status is a system execution outcome only",
+            "status": (
+                feedback.effectiveness.value
+                if feedback
+                else "unknown_without_external_evidence"
+            ),
+            "eventOutcome": feedback.event_outcome.value if feedback else EventOutcome.UNKNOWN.value,
+            "source": "operator_feedback" if feedback else "none",
+            "confirmed": bool(
+                feedback
+                and feedback.effectiveness != FeedbackEffectiveness.UNKNOWN
+                and feedback.event_outcome != EventOutcome.UNKNOWN
+            ),
+            "reason": (
+                None
+                if feedback
+                else "workflow terminal status is a system execution outcome only"
+            ),
         },
+    }
+
+
+def _build_recommendation_feedback(
+    run: WorkflowRun,
+    plan_facts: Dict[str, Any],
+    approvals: List[WorkflowApproval],
+    action_records: List[WorkflowActionRecord],
+) -> Dict[str, Any]:
+    decisions = [approval.decision for approval in approvals]
+    approved_count = sum(
+        decision == ApprovalDecision.APPROVED for decision in decisions
+    )
+    edited_count = sum(decision == ApprovalDecision.EDITED for decision in decisions)
+    rejected_count = sum(
+        decision == ApprovalDecision.REJECTED for decision in decisions
+    )
+    decided_count = approved_count + edited_count + rejected_count
+    if rejected_count and rejected_count == decided_count:
+        status = "rejected"
+    elif edited_count or (rejected_count and (approved_count or edited_count)):
+        status = "modified"
+    elif approved_count or (not approvals and action_records):
+        status = "accepted"
+    elif run.status.value == "rejected":
+        status = "rejected"
+    else:
+        status = "unknown"
+
+    plan_actions = [
+        {
+            "actionStepId": step.get("stepId"),
+            "actionType": step.get("actionType"),
+            "params": step.get("params") or {},
+        }
+        for step in (plan_facts.get("steps") or [])
+        if isinstance(step, dict) and step.get("actionType")
+    ]
+    approval_proposals = [
+        item
+        for approval in approvals
+        for item in approval.proposed_actions
+        if isinstance(item, dict)
+    ]
+    final_actions: List[Dict[str, Any]] = []
+    modifications: List[Dict[str, Any]] = []
+    for approval in approvals:
+        adopted = (
+            approval.edited_actions
+            if approval.decision == ApprovalDecision.EDITED
+            else approval.proposed_actions
+            if approval.decision == ApprovalDecision.APPROVED
+            else []
+        )
+        final_actions.extend(_compact_action(item) for item in adopted)
+        modifications.extend(
+            {
+                "approvalId": approval.approval_id,
+                **item,
+            }
+            for item in _structured_action_diff(
+                approval.proposed_actions,
+                adopted,
+            )
+        )
+    # Approval records describe the human-adopted subset, while action records
+    # are the durable source for actions that actually ran without an approval
+    # gate.  Keep both: a mixed Workflow must not lose its automatic actions,
+    # and a rejected proposal only enters the final plan if it nevertheless has
+    # a real execution record.
+    final_actions.extend(
+        _compact_action(
+            {
+                "actionStepId": record.node_id,
+                "actionType": record.action_type,
+                "params": record.params,
+            }
+        )
+        for record in action_records
+    )
+
+    return {
+        "status": status,
+        "source": "workflow_approvals + frozen_plan + action_records",
+        "originalRecommendation": {
+            "planId": plan_facts.get("planId"),
+            "planVersion": plan_facts.get("version"),
+            # Durable approval proposals carry the concrete review-time params
+            # for gated actions; frozen Plan actions fill in the remainder.
+            "actionRefs": _dedupe_actions(approval_proposals + plan_actions),
+        },
+        "finalPlan": {
+            "planId": plan_facts.get("planId"),
+            # The Workflow is bound to its frozen Plan snapshot.  A later Plan
+            # revision must never be relabelled as this run's adopted version.
+            "planVersion": plan_facts.get("version"),
+            "actions": _dedupe_actions(final_actions),
+        },
+        "modifications": modifications[:100],
+        "approvalIds": [approval.approval_id for approval in approvals],
+        "reviewers": sorted({
+            _short_text(approval.reviewer, max_text=200)
+            for approval in approvals
+            if approval.reviewer
+        }),
+        "rejectionReasons": [
+            {
+                "approvalId": approval.approval_id,
+                "reasonCode": approval.reason_code.value,
+            }
+            for approval in approvals
+            if approval.decision == ApprovalDecision.REJECTED
+        ],
+        "decidedAt": max(
+            (approval.decided_at for approval in approvals if approval.decided_at),
+            default=None,
+        ),
+        "counts": {
+            "accepted": approved_count,
+            "modified": edited_count,
+            "rejected": rejected_count,
+        },
+    }
+
+
+def _build_action_feedback(
+    plan_facts: Dict[str, Any],
+    approvals: List[WorkflowApproval],
+    action_records: List[WorkflowActionRecord],
+    feedback: Optional[TrafficEventFeedback],
+    workflow_repo: SQLiteWorkflowRepository,
+) -> List[Dict[str, Any]]:
+    proposed = [
+        {
+            "actionStepId": step.get("stepId"),
+            "actionType": step.get("actionType"),
+            "params": step.get("params") or {},
+        }
+        for step in (plan_facts.get("steps") or [])
+        if isinstance(step, dict) and step.get("actionType")
+    ]
+    for approval in approvals:
+        proposed.extend(approval.proposed_actions)
+    proposed = _dedupe_actions(proposed)
+
+    final_actions: List[Dict[str, Any]] = []
+    for approval in approvals:
+        if approval.decision == ApprovalDecision.APPROVED:
+            final_actions.extend(approval.proposed_actions)
+        elif approval.decision == ApprovalDecision.EDITED:
+            final_actions.extend(approval.edited_actions)
+    # An approval covers only its gated actions.  Automatic actions still need
+    # to appear in the final projection, and the action record is the durable
+    # proof that they were actually executed.  Rejected, unexecuted proposals
+    # are intentionally absent because they have no adopted action or record.
+    final_actions.extend(
+        {
+            "actionStepId": record.node_id,
+            "actionType": record.action_type,
+            "params": record.params,
+        }
+        for record in action_records
+    )
+    final_actions = _dedupe_actions(final_actions)
+
+    entries: List[Dict[str, Any]] = []
+    consumed_record_ids: set[str] = set()
+    for index, proposed_action in enumerate(proposed):
+        final_action = _find_matching_action(proposed_action, final_actions, index)
+        record = _find_matching_record(
+            final_action or proposed_action,
+            action_records,
+            consumed_record_ids,
+        )
+        if record:
+            consumed_record_ids.add(record.action_id)
+        entries.append(_project_action_feedback(
+            proposed_action=proposed_action,
+            final_action=final_action,
+            record=record,
+            feedback=feedback,
+            workflow_repo=workflow_repo,
+        ))
+    for record in action_records:
+        if record.action_id in consumed_record_ids:
+            continue
+        final_action = {
+            "actionStepId": record.node_id,
+            "actionType": record.action_type,
+            "params": record.params,
+        }
+        entries.append(_project_action_feedback(
+            proposed_action=None,
+            final_action=final_action,
+            record=record,
+            feedback=feedback,
+            workflow_repo=workflow_repo,
+        ))
+    return entries[:100]
+
+
+def _project_action_feedback(
+    *,
+    proposed_action: Optional[Dict[str, Any]],
+    final_action: Optional[Dict[str, Any]],
+    record: Optional[WorkflowActionRecord],
+    feedback: Optional[TrafficEventFeedback],
+    workflow_repo: SQLiteWorkflowRepository,
+) -> Dict[str, Any]:
+    status = record.status.value if record else (
+        "rejected" if proposed_action and not final_action else "approved"
+    )
+    attempts = workflow_repo.list_action_attempts(record.action_id) if record else []
+    terminal_execution_statuses = {
+        ActionStatus.SUCCEEDED,
+        ActionStatus.FAILED,
+        ActionStatus.UNKNOWN,
+        ActionStatus.CANCELLED,
+    }
+    assessment = None
+    if feedback and record:
+        assessment = next(
+            (
+                item for item in feedback.action_assessments
+                if isinstance(item, dict)
+                and item.get("actionExecutionId") == record.action_id
+            ),
+            None,
+        )
+    if assessment:
+        action_effectiveness = str(
+            assessment.get("effectiveness") or FeedbackEffectiveness.UNKNOWN.value
+        )
+        business_reason = str(
+            assessment.get("reasonCode") or "NONE"
+        )
+        effectiveness_source = "operator_action_feedback"
+    elif feedback and record and feedback.action_execution_id == record.action_id:
+        action_effectiveness = feedback.effectiveness.value
+        business_reason = feedback.reason_code.value
+        effectiveness_source = "operator_event_feedback_legacy_link"
+    else:
+        action_effectiveness = FeedbackEffectiveness.UNKNOWN.value
+        business_reason = "NONE"
+        effectiveness_source = "none"
+    return {
+        "actionExecutionId": record.action_id if record else None,
+        "actionStepId": (
+            (final_action or {}).get("actionStepId")
+            or (final_action or {}).get("stepId")
+            or (proposed_action or {}).get("actionStepId")
+            or (proposed_action or {}).get("stepId")
+            or (record.node_id if record else None)
+        ),
+        "actionType": (
+            _action_type(final_action)
+            or _action_type(proposed_action)
+            or (record.action_type if record else None)
+        ),
+        "proposed": proposed_action is not None,
+        "approved": final_action is not None,
+        "executed": bool(record and record.status in terminal_execution_statuses),
+        "succeeded": bool(record and record.status == ActionStatus.SUCCEEDED),
+        "failed": bool(record and record.status == ActionStatus.FAILED),
+        "cancelled": bool(record and record.status == ActionStatus.CANCELLED),
+        "blocked": bool(record and record.status == ActionStatus.BLOCKED),
+        "status": status,
+        "retryCount": max(
+            max(0, int(record.attempt or 0) - 1) if record else 0,
+            max(0, len(attempts) - 1),
+        ),
+        "enteredUnknown": bool(
+            record and (
+                record.status == ActionStatus.UNKNOWN
+                or any(attempt.status == ActionStatus.UNKNOWN for attempt in attempts)
+            )
+        ),
+        "reconciled": bool(
+            record
+            and (record.reconciliation_attempts or record.last_reconciled_at)
+        ),
+        "reconciliationAttempts": int(
+            record.reconciliation_attempts or 0
+        ) if record else 0,
+        "humanReplaced": bool(
+            proposed_action
+            and final_action
+            and _compact_action(proposed_action) != _compact_action(final_action)
+        ),
+        "businessEffectiveness": action_effectiveness,
+        "businessEffectivenessSource": effectiveness_source,
+        "businessReasonCode": business_reason,
+        "proposedAction": _compact_action(proposed_action) if proposed_action else None,
+        "finalAction": _compact_action(final_action) if final_action else None,
+        "error": _short_text(record.error) if record else None,
+    }
+
+
+def _build_event_outcome(
+    run: WorkflowRun,
+    event_snapshot: Dict[str, Any],
+    action_records: List[WorkflowActionRecord],
+    feedback: Optional[TrafficEventFeedback],
+) -> Dict[str, Any]:
+    counts: Dict[str, int] = {}
+    for record in action_records:
+        counts[record.status.value] = counts.get(record.status.value, 0) + 1
+    operator = {
+        "outcome": feedback.event_outcome.value if feedback else EventOutcome.UNKNOWN.value,
+        "effectiveness": (
+            feedback.effectiveness.value if feedback else FeedbackEffectiveness.UNKNOWN.value
+        ),
+        "reasonCode": feedback.reason_code.value if feedback else "NONE",
+        "comment": _short_text(feedback.comment, max_text=1000) if feedback else None,
+        "reviewer": _short_text(feedback.reviewer, max_text=200) if feedback else None,
+        "assessedAt": feedback.updated_at if feedback else None,
+        "source": "operator_feedback" if feedback else "none",
+    }
+    return {
+        "systemAssessment": {
+            "workflowStatus": run.status.value,
+            "eventStatus": event_snapshot.get("status"),
+            "eventMarkedHandled": event_snapshot.get("status") in {
+                "已处置", "待复盘", "已归档"
+            },
+            "actionStatusCounts": counts,
+            "source": "workflow_runs + event_records + workflow_action_records",
+        },
+        "operatorAssessment": operator,
+        "businessOutcomeConfirmed": bool(
+            feedback
+            and feedback.event_outcome != EventOutcome.UNKNOWN
+            and feedback.effectiveness != FeedbackEffectiveness.UNKNOWN
+        ),
+        "workflowCompletionEqualsBusinessEffect": False,
     }
 
 
@@ -566,6 +1024,7 @@ def _build_lessons(
                 "type": "human_approval_rejected",
                 "source": "workflow_approvals",
                 "approvalId": decision.get("approvalId"),
+                "reasonCode": decision.get("reasonCode"),
             })
         if decision.get("manualAdjustment"):
             lessons.append({
@@ -600,16 +1059,55 @@ def _build_lessons(
 def _quality_status(
     *,
     run: WorkflowRun,
-    plan_facts: Dict[str, Any],
-    agent_facts: Dict[str, Any],
-    human_decisions: List[Dict[str, Any]],
+    feedback: Optional[TrafficEventFeedback],
+    event_outcome: Dict[str, Any],
     action_records: List[WorkflowActionRecord],
 ) -> CaseMemoryQuality:
-    if not run.completed_at:
-        return CaseMemoryQuality.LOW_EVIDENCE
-    if plan_facts and (agent_facts or human_decisions or action_records):
-        return CaseMemoryQuality.VALIDATED
-    return CaseMemoryQuality.PARTIAL
+    # Workflow completion and HTTP success are system facts, not proof that the
+    # traffic intervention worked.  Without an operator outcome this case must
+    # remain explicitly unverified.
+    if feedback is None or (
+        feedback.effectiveness == FeedbackEffectiveness.UNKNOWN
+        and feedback.event_outcome == EventOutcome.UNKNOWN
+    ):
+        return CaseMemoryQuality.UNVERIFIED
+
+    if (
+        feedback.effectiveness == FeedbackEffectiveness.INEFFECTIVE
+        or feedback.event_outcome in {
+            EventOutcome.UNRESOLVED,
+            EventOutcome.CANCELLED,
+        }
+    ):
+        return CaseMemoryQuality.FAILED_OUTCOME
+
+    if (
+        feedback.effectiveness == FeedbackEffectiveness.PARTIALLY_EFFECTIVE
+        or feedback.event_outcome == EventOutcome.PARTIALLY_RESOLVED
+    ):
+        return CaseMemoryQuality.PARTIAL_SUCCESS
+
+    if feedback.lifecycle != FeedbackLifecycle.COMPLETE:
+        return CaseMemoryQuality.INCOMPLETE
+
+    unsafe_action_statuses = {
+        ActionStatus.FAILED,
+        ActionStatus.UNKNOWN,
+        ActionStatus.CANCELLED,
+        ActionStatus.BLOCKED,
+        ActionStatus.RUNNING,
+        ActionStatus.EXECUTING,
+        ActionStatus.PENDING,
+    }
+    if (
+        feedback.effectiveness == FeedbackEffectiveness.EFFECTIVE
+        and feedback.event_outcome == EventOutcome.RESOLVED
+        and run.status.value == "completed"
+        and not any(record.status in unsafe_action_statuses for record in action_records)
+        and event_outcome.get("businessOutcomeConfirmed") is True
+    ):
+        return CaseMemoryQuality.VERIFIED_SUCCESS
+    return CaseMemoryQuality.PARTIAL_SUCCESS
 
 
 def _build_generated_summary(event_snapshot: Dict[str, Any], run: WorkflowRun) -> str:
@@ -623,6 +1121,182 @@ def _approval_counts(approvals: List[WorkflowApproval]) -> Dict[str, int]:
     for approval in approvals:
         counts[approval.decision.value] = counts.get(approval.decision.value, 0) + 1
     return counts
+
+
+def _action_type(action: Any) -> str:
+    if not isinstance(action, dict):
+        return ""
+    return str(action.get("actionType") or action.get("action_type") or "").strip()
+
+
+def _action_identity(action: Any, index: int = 0) -> str:
+    if not isinstance(action, dict):
+        return f"index:{index}"
+    for key in ("actionStepId", "targetActionStepId", "stepId"):
+        value = str(action.get(key) or "").strip()
+        if value:
+            return f"step:{value}"
+    action_type = _action_type(action)
+    return f"type:{action_type}" if action_type else f"index:{index}"
+
+
+def _dedupe_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            continue
+        compact = _compact_action(action)
+        identity = _action_identity(compact, index)
+        # Same-type actions can be legitimate when they bind different params;
+        # include the compact value in that fallback identity.
+        if identity.startswith("type:"):
+            identity += ":" + json.dumps(
+                compact.get("params") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(compact)
+    return result
+
+
+def _find_matching_action(
+    action: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    index: int = 0,
+) -> Optional[Dict[str, Any]]:
+    identity = _action_identity(action, index)
+    if identity.startswith("step:"):
+        for candidate_index, candidate in enumerate(candidates):
+            if _action_identity(candidate, candidate_index) == identity:
+                return candidate
+        action_type = _action_type(action)
+        if action_type:
+            # Legacy edited approvals may omit their step id.  Permit that
+            # fallback, but never bind this proposal to a different explicit
+            # step merely because the action types happen to match.
+            for candidate_index, candidate in enumerate(candidates):
+                if (
+                    not _action_identity(candidate, candidate_index).startswith("step:")
+                    and _action_type(candidate) == action_type
+                ):
+                    return candidate
+        return None
+    action_type = _action_type(action)
+    if action_type:
+        for candidate in candidates:
+            if _action_type(candidate) == action_type:
+                return candidate
+        # A typed rejected proposal must never be paired positionally with an
+        # unrelated automatic action merely because both occupy the same list
+        # index.  Positional recovery is reserved for legacy untyped payloads.
+        return None
+    return candidates[index] if index < len(candidates) else None
+
+
+def _find_matching_record(
+    action: Dict[str, Any],
+    records: List[WorkflowActionRecord],
+    consumed: set[str],
+) -> Optional[WorkflowActionRecord]:
+    step_id = str(
+        action.get("actionStepId")
+        or action.get("targetActionStepId")
+        or action.get("stepId")
+        or ""
+    ).strip()
+    action_type = _action_type(action)
+    for record in records:
+        if record.action_id not in consumed and step_id and record.node_id == step_id:
+            return record
+    for record in records:
+        if (
+            record.action_id not in consumed
+            and action_type
+            and record.action_type == action_type
+        ):
+            return record
+    return None
+
+
+def _structured_action_diff(
+    proposed_actions: List[Dict[str, Any]],
+    final_actions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return bounded field-level edits, never a lossy string diff."""
+
+    proposed = [item for item in proposed_actions if isinstance(item, dict)]
+    final = [item for item in final_actions if isinstance(item, dict)]
+    remaining = list(enumerate(final))
+    diffs: List[Dict[str, Any]] = []
+    for proposed_index, raw_proposed in enumerate(proposed):
+        match_position: Optional[int] = None
+        proposed_identity = _action_identity(raw_proposed, proposed_index)
+        for position, (final_index, raw_final) in enumerate(remaining):
+            final_identity = _action_identity(raw_final, final_index)
+            if (
+                proposed_identity == final_identity
+                or (
+                    _action_type(raw_proposed)
+                    and _action_type(raw_proposed) == _action_type(raw_final)
+                )
+            ):
+                match_position = position
+                break
+        if match_position is None:
+            diffs.append({
+                "actionKey": proposed_identity,
+                "field": "$action",
+                "proposedValue": _compact_action(raw_proposed),
+                "finalValue": None,
+                "modificationType": "removed",
+            })
+            continue
+        final_index, raw_final = remaining.pop(match_position)
+        before = _flatten_action(_compact_action(raw_proposed))
+        after = _flatten_action(_compact_action(raw_final))
+        for field_name in sorted(set(before) | set(after)):
+            old = before.get(field_name)
+            new = after.get(field_name)
+            if old == new:
+                continue
+            if field_name not in before:
+                kind = "added"
+            elif field_name not in after:
+                kind = "removed"
+            else:
+                kind = "changed"
+            diffs.append({
+                "actionKey": _action_identity(raw_final, final_index),
+                "field": field_name,
+                "proposedValue": old,
+                "finalValue": new,
+                "modificationType": kind,
+            })
+    for final_index, raw_final in remaining:
+        diffs.append({
+            "actionKey": _action_identity(raw_final, final_index),
+            "field": "$action",
+            "proposedValue": None,
+            "finalValue": _compact_action(raw_final),
+            "modificationType": "added",
+        })
+    return diffs[:100]
+
+
+def _flatten_action(value: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    flattened: Dict[str, Any] = {}
+    for key, nested in value.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(nested, dict):
+            flattened.update(_flatten_action(nested, path))
+        else:
+            flattened[path] = _compact_json(nested)
+    return flattened
 
 
 def _compact_action(action: Any) -> Dict[str, Any]:
@@ -647,6 +1321,7 @@ def _compact_action(action: Any) -> Dict[str, Any]:
 
 
 def _compact_json(value: Any, max_items: int = 50, max_text: int = 500) -> Any:
+    value = sanitize_public_value(value)
     if isinstance(value, dict):
         items = list(value.items())[:max_items]
         return {str(k): _compact_json(v, max_items=max_items, max_text=max_text) for k, v in items}
@@ -689,7 +1364,43 @@ def _short_text(value: Any, max_text: int = 500) -> Any:
         return None
     if isinstance(value, (int, float, bool)):
         return value
-    text = str(value)
+    text = sanitize_public_text(value)
     if len(text) <= max_text:
         return text
     return text[: max_text - 1] + "..."
+
+
+def _latest_timestamp(values: List[Any]) -> Optional[str]:
+    latest: Optional[tuple[datetime, str]] = None
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.astimezone(timezone.utc)
+        candidate = (parsed, value)
+        if latest is None or candidate[0] > latest[0]:
+            latest = candidate
+    return latest[1] if latest else None
+
+
+def _source_fact_horizon(values: List[Any]) -> str:
+    """Return a trustworthy horizon or fail closed at projection time."""
+
+    present = [value for value in values if value is not None and value != ""]
+    if not present:
+        return utc_now_iso()
+    for value in present:
+        if not isinstance(value, str):
+            return utc_now_iso()
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return utc_now_iso()
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+    return _latest_timestamp(present) or utc_now_iso()

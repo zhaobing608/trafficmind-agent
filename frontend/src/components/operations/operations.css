@@ -1,0 +1,61 @@
+.operations-workspace { width: 100%; color: #1f2937; }
+.operations-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 16px; }
+.operations-header h1 { margin: 0; font-size: 22px; line-height: 1.3; font-weight: 650; }
+.operations-header p { margin: 5px 0 0; color: #6b7280; font-size: 13px; }
+.operations-header small { display: block; margin-top: 5px; color: #a0a7b2; font-size: 11px; }
+.operations-title-line { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.operations-health { display: inline-flex; align-items: center; min-height: 23px; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 650; }
+.operations-health.is-healthy { color: #047857; background: #ecfdf5; border: 1px solid #a7f3d0; }
+.operations-health.needs-attention { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; }
+.operations-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.operations-actions button, .operations-empty-page button { display: inline-flex; align-items: center; gap: 6px; min-height: 34px; padding: 6px 11px; border: 1px solid #e5eaf0; border-radius: 6px; color: #334155; background: #fff; cursor: pointer; font-size: 12px; }
+.operations-actions button.is-primary { color: #fff; border-color: #0f766e; background: #0f766e; }
+.operations-actions button:disabled { opacity: .6; cursor: default; }
+.operations-error { margin-bottom: 10px; padding: 9px 12px; border: 1px solid #fed7aa; border-radius: 6px; color: #9a3412; background: #fff7ed; font-size: 12px; }
+.operations-scan-result { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 12px; padding: 9px 12px; border: 1px solid #cbe7e1; border-radius: 6px; color: #0f766e; background: #eef8f5; font-size: 12px; }
+.operations-scan-result span { color: #6b7280; }
+.operations-metric-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 9px; }
+.operations-metric { min-width: 0; padding: 13px 14px; border: 1px solid #e5eaf0; border-radius: 8px; background: #fff; }
+.operations-metric span { display: block; color: #6b7280; font-size: 11px; overflow-wrap: anywhere; }
+.operations-metric strong { display: block; margin-top: 5px; color: #1f2937; font-size: 24px; line-height: 1; font-variant-numeric: tabular-nums; }
+.operations-metric.is-warning { border-color: #fde68a; background: #fffbeb; }
+.operations-metric.is-danger { border-color: #fecaca; background: #fef2f2; }
+.operations-facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin-top: 12px; overflow: hidden; border: 1px solid #e5eaf0; border-radius: 8px; background: #e5eaf0; }
+.operations-fact { min-width: 0; padding: 11px 12px; background: #fff; }
+.operations-fact span, .operations-fact strong, .operations-fact small { display: block; }
+.operations-fact span { color: #6b7280; font-size: 11px; }
+.operations-fact strong { margin-top: 3px; font-size: 13px; }
+.operations-fact small { margin-top: 3px; color: #6b7280; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.operations-panel-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; align-items: start; }
+.operations-panel { min-width: 0; border: 1px solid #e5eaf0; border-radius: 8px; background: #fff; overflow: hidden; }
+.operations-alert-panel { grid-column: 1 / -1; }
+.operations-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 13px; border-bottom: 1px solid #eef1f5; background: #fafbfc; }
+.operations-panel-heading h2 { margin: 0; font-size: 13px; font-weight: 650; }
+.operations-panel-heading span { min-width: 23px; padding: 2px 7px; border-radius: 999px; color: #475569; background: #eef1f5; text-align: center; font-size: 11px; font-variant-numeric: tabular-nums; }
+.operations-row { padding: 12px 13px; border-bottom: 1px solid #eef1f5; }
+.operations-row:last-child { border-bottom: 0; }
+.operations-row-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.operations-row-head strong { min-width: 0; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.operations-row p { margin: 4px 0 0; color: #6b7280; font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+.operations-state, .operations-severity { flex: none; padding: 2px 6px; border-radius: 5px; font-size: 10px; font-weight: 700; }
+.operations-state.is-unknown { color: #9a3412; background: #fff7ed; border: 1px solid #fed7aa; }
+.operations-state.is-overdue { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; }
+.operations-severity { color: #475569; background: #f8fafc; border: 1px solid #e2e8f0; }
+.operations-severity.severity-critical, .operations-severity.severity-high { color: #b91c1c; background: #fef2f2; border-color: #fecaca; }
+.operations-severity.severity-medium { color: #92400e; background: #fffbeb; border-color: #fde68a; }
+.operations-links { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
+.operations-links button { max-width: 100%; padding: 0; border: 0; color: #0f766e; background: transparent; cursor: pointer; font-size: 11px; text-align: left; overflow-wrap: anywhere; }
+.operations-empty { padding: 28px 14px; color: #a0a7b2; text-align: center; font-size: 12px; }
+.operations-empty-page { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; min-height: 260px; border: 1px solid #e5eaf0; border-radius: 8px; color: #6b7280; background: #fff; font-size: 13px; }
+.operations-workspace button:focus-visible { outline: 2px solid #0f766e; outline-offset: 2px; }
+@media (max-width: 1180px) {
+  .operations-metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .operations-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .operations-header { flex-direction: column; }
+  .operations-metric-grid, .operations-panel-grid { grid-template-columns: 1fr; }
+  .operations-alert-panel { grid-column: auto; }
+  .operations-facts { grid-template-columns: 1fr; }
+  .operations-scan-result { flex-direction: column; }
+}

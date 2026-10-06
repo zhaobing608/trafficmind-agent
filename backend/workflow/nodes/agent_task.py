@@ -13,6 +13,7 @@ from typing import Any, Dict
 
 from backend.workflow.models import NodeConfig
 from backend.workflow.state import TrafficWorkflowState
+from backend.workflow.action_execution import contains_sensitive_key
 from backend.tools.event_tools import safe_float
 
 
@@ -129,8 +130,16 @@ async def execute_agent_task(
         existing = list(state.proposed_actions or [])
         for pa in agent_proposed:
             if isinstance(pa, dict):
-                pa["source"] = agent_name
-                existing.append(pa)
+                if contains_sensitive_key(pa):
+                    state.add_audit_event(
+                        "action_proposal_blocked",
+                        config.node_id,
+                        {"agentName": agent_name, "reason": "credential-shaped field"},
+                    )
+                    continue
+                safe_proposal = dict(pa)
+                safe_proposal["source"] = agent_name
+                existing.append(safe_proposal)
         state.proposed_actions = existing
 
     # 只在 state 中存 summary + evidence refs

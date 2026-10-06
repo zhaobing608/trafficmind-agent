@@ -209,15 +209,25 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(collab_db, "datetime", G3B.FixedDateTime)
 
     import backend.agent.collaboration.state as collab_state
+    import backend.case_memory.models as case_models
     import backend.planning.models as planning_models
+    import backend.regional.repository as regional_repository_module
+    import backend.workflow.nodes.action as workflow_action_node
+    import backend.workflow.nodes.human_approval as workflow_approval_node
     import backend.workflow.executor as workflow_executor
     import backend.workflow.models as workflow_models
+    import backend.workflow.repository as workflow_repository_module
     import backend.workflow.state as workflow_state
 
     monkeypatch.setattr(collab_state, "datetime", G3B.FixedDateTime)
+    monkeypatch.setattr(case_models, "datetime", G3B.FixedDateTime)
+    monkeypatch.setattr(regional_repository_module, "datetime", G3B.FixedDateTime)
     monkeypatch.setattr(planning_models, "datetime", G3B.FixedDateTime)
+    monkeypatch.setattr(workflow_action_node, "datetime", G3B.FixedDateTime)
+    monkeypatch.setattr(workflow_approval_node, "datetime", G3B.FixedDateTime)
     monkeypatch.setattr(workflow_executor, "datetime", G3B.FixedDateTime)
     monkeypatch.setattr(workflow_models, "datetime", G3B.FixedDateTime)
+    monkeypatch.setattr(workflow_repository_module, "datetime", G3B.FixedDateTime)
     monkeypatch.setattr(workflow_state, "datetime", G3B.FixedDateTime)
 
     chat_db.reset_initialized()
@@ -579,8 +589,13 @@ def _materialize_g3b_cases(app_client, isolated, monkeypatch, history_events: Li
             assert terminal_run is not None
             assert terminal_run.status == expected_status
             assert terminal_run.completed_at
+            automatically_projected = isolated["caseRepo"].get_case_by_source_workflow_run_id(
+                workflow_run_id
+            )
+            assert automatically_projected is not None
             built = service.build_from_workflow_run(workflow_run_id)
-            assert built.created is True
+            assert built.created is False
+            assert built.case.case_id == automatically_projected.case_id
             assert built.case.final_status == expected_status.value
             created_cases.append(built.case)
 
